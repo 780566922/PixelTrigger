@@ -1,0 +1,13 @@
+# 打包产物
+build/
+dist/
+*.egg-info/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# macOS 系统文件
+.DS_Store
