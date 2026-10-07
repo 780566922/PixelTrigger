@@ -166,7 +166,10 @@ echo "构建完成: ${APP} (${SIZE})"
 
 # --------------------------------------------------------------- DMG
 if [[ "${MAKE_DMG}" == "1" ]]; then
-  DMG="${PROJECT_DIR}/dist/${APP_NAME}-1.0.0.dmg"
+  # 从 setup.py 解析 VERSION，保证 DMG 文件名与 .app 内版本号始终一致，
+  # 避免升级版本时漏改其中一处。
+  APP_VERSION="$("${VENV_DIR}/bin/python" -c "import ast;print(next(n.value.value for n in ast.walk(ast.parse(open('${PROJECT_DIR}/setup.py').read())) if isinstance(n,ast.Assign) and getattr(n.targets[0],'id','')=='VERSION'))")"
+  DMG="${PROJECT_DIR}/dist/${APP_NAME}-${APP_VERSION}.dmg"
   echo "==> 生成 DMG"
   DMG_STAGE="$(mktemp -d /tmp/pt-dmg.XXXXXX)"
   # 必须用 cp -R：ditto 在目标已存在时会展开 bundle 内容，丢失 .app 目录层级
