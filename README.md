@@ -19,7 +19,7 @@
 
 ### macOS
 
-1. 从 Releases 页面下载最新的 `PixelTrigger-1.1.0.dmg`（或 `PixelTrigger.app.zip`）
+1. 从 Releases 页面下载最新的 `PixelTrigger-1.2.0.dmg`（或 `PixelTrigger.app.zip`）
 2. 打开 DMG，把 PixelTrigger 拖到「应用程序」文件夹；或解压 zip 后手动拖入
 3. 第一次打开：右键点击 App，选择「打开」，弹窗里再点「打开」
 4. 授权：
@@ -112,7 +112,7 @@ python color_watcher.py
 
 ```bash
 ./build_app.sh               # 生成 dist/PixelTrigger.app
-./build_app.sh --dmg         # 同时生成 dist/PixelTrigger-1.1.0.dmg
+./build_app.sh --dmg         # 同时生成 dist/PixelTrigger-1.2.0.dmg
 ```
 
 脚本会自动完成：创建隔离的构建虚拟环境、安装依赖、应用 py2app 兼容补丁、
