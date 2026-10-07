@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk, scrolledtext
+from tkinter import ttk, scrolledtext, messagebox
 from PIL import Image, ImageTk
 import Quartz
 import subprocess
@@ -9,19 +9,27 @@ import sys
 import json
 import math
 import threading
+import queue
 
 try:
-    from ApplicationServices import AXIsProcessTrusted
+    from ApplicationServices import AXIsProcessTrusted, AXIsProcessTrustedWithOptions
     HAS_AX = True
 except ImportError:
     AXIsProcessTrusted = None
+    AXIsProcessTrustedWithOptions = None
     HAS_AX = False
 
 # ============================================================
 APP_NAME = "PixelTrigger"
 APP_SUPPORT_DIR = os.path.expanduser(f"~/Library/Application Support/{APP_NAME}")
-CONFIG_FILE = os.path.join(APP_SUPPORT_DIR, "config.json")
-os.makedirs(APP_SUPPORT_DIR, exist_ok=True)
+
+# 测试/自动化脚本通过设置 PIXELTRIGGER_CONFIG 指向临时路径，
+# 避免污染用户真实配置（历史上已两次因测试 save_config 覆盖真实数据）。
+CONFIG_FILE = os.environ.get(
+    "PIXELTRIGGER_CONFIG",
+    os.path.join(APP_SUPPORT_DIR, "config.json"),
+)
+os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
 
 
 def get_donation_path():
@@ -76,6 +84,26 @@ PREVIEW_INTERVAL = 1.0
 PREVIEW_HOLD_AFTER = 3.0
 COUNTDOWN_TICK_MS = 100
 PERM_CHECK_MS = 1000
+# 主线程 UI 派发队列的轮询间隔（毫秒）。后台线程的 UI 更新经过
+# 该队列收口到主线程，避免跨线程操作 Tk 导致崩溃。
+UI_POLL_MS = 30
+
+# 系统外观轮询间隔。macOS 没有公开的「外观变化」广播通知，
+# 只能轮询 AppleInterfaceStyle；1 秒足以让肉眼感知为实时，
+# 又不会因为频繁读preferences 造成可观的CPU 占用。
+THEME_POLL_MS = 1000
+
+# 日志区保留的最大行数，超出后丢弃最旧的。
+LOG_MAX_LINES = 2000
+
+# 显示器列表最大数量（CGGetActiveDisplayList 缓冲区上限）
+MAX_DISPLAYS = 16
+
+# Tk 事件 state 中的修饰键位掩码（与 Quartz 的 kCGEventFlagMask* 对应）
+FLAG_MASK_CMD = 0x0010
+FLAG_MASK_OPT = 0x0008
+FLAG_MASK_CTRL = 0x0004
+FLAG_MASK_SHIFT = 0x0001
 
 HUE_PRESETS = [
     ("赤", "#FF3B30", (255, 59, 48)),
@@ -133,17 +161,240 @@ C_GRAY_BG = "#E5E5EA"
 C_GRAY_BG_H = "#D1D1D6"
 C_GRAY_DISABLED = "#D0D0D0"
 C_GRAY_DISABLED_FG = "#A0A0A5"
+C_ON_ACCENT = "#FFFFFF"
+# 亮色按钮（绿/红系）上的文字色。白色文字在亮绿底(#30D158)上对比度仅
+# 2.02，远低于 WCAG AA 的 4.5；改用近黑可达 8.32。这是亮底必配深字的
+# 通用规律，故与 C_ON_ACCENT（深色底上的白字）分开定义。
+C_ON_LIGHT_BTN = "#0B3D1E"
+# 红底按钮专用前景：白字在 #FF3B30 上仅 3.55，深字可达 4.74
+C_ON_RED_BTN = "#1D1D1F"
+C_ON_RED_BTN_H = "#1D1D1F"
+C_ON_LIGHT_BTN_H = "#0B3D1E"
+#蓝底按钮专用前景：亮蓝底需深字，深蓝底用白字
+C_ON_ACCENT_BTN = "#FFFFFF"
+C_ON_ACCENT_BTN_H = "#FFFFFF"
+C_NEUTRAL_BTN = "#6E6E73"
+C_NEUTRAL_BTN_H = "#5A5A5E"
+C_ENTRY_BG = "#FFFFFF"
+C_PREVIEW_BG = "#F5F5F7"
+# 屏幕取色覆盖层的标记色（叠在任意截图上，必须高对比）
+C_MARK_RED = "#FF3B30"
+C_MARK_ON_RED = "#FFFFFF"
+C_MARK_YELLOW = "#FFCC00"
+C_MARK_CYAN = "#00C7BE"
+
+
+# ============================================================
+# 主题：跟随系统浅色 / 深色外观
+# ============================================================
+# Tkinter 没有原生主题支持，控件配色全部由本文件显式指定，因此需要
+# 自行读取系统外观并切换调色板。系统深色时 defaults 返回 "Dark"，
+# 浅色（或未设置）时该键不存在，命令返回非 0。
+THEME_LIGHT = "light"
+THEME_DARK = "dark"
+
+LIGHT_PALETTE = {
+    "window_bg": "#ECECEC",
+    "card_bg": "#FFFFFF",
+    "card_border": "#E2E2E2",
+    "title": "#1D1D1F",
+    "card_title": "#6E6E73",
+    "label": "#3A3A3C",
+    "subtext": "#66666A",
+    "accent": "#0062CC",
+    "accent_h": "#0052A8",
+    "green": "#34C759",
+    "green_h": "#1B7F35",
+    "orange": "#FF9500",
+    "red": "#FF3B30",
+    "red_h": "#B31D1D",
+    "hue_border": "#C7C7CC",
+    "gray_bg": "#E5E5EA",
+    "gray_bg_h": "#D1D1D6",
+    "gray_disabled": "#D0D0D0",
+    "gray_disabled_fg": "#48484A",
+    "on_accent": "#FFFFFF",
+    #浅色主题下绿底 #34C759 配白字仅 2.55，同样需深字
+    "on_light_btn": "#0B3D1E",
+    "on_light_btn_h": "#FFFFFF",
+    "on_red_btn": "#1D1D1F",
+    "on_red_btn_h": "#FFFFFF",
+    "on_accent_btn": "#FFFFFF",
+    "on_accent_btn_h": "#FFFFFF",
+    "neutral_btn": "#6E6E73",
+    "neutral_btn_h": "#5A5A5E",
+    "entry_bg": "#FFFFFF",
+    "preview_bg": "#F5F5F7",
+    "mark_red": "#FF3B30",
+    "mark_on_red": "#FFFFFF",
+    "mark_yellow": "#FFCC00",
+    "mark_cyan": "#00C7BE",
+}
+
+# 深色下调色板遵循 Apple HIG 语义色：背景用 elevation 层级区分，
+# 文字用 label 层级（primary / secondary / tertiary）。
+DARK_PALETTE = {
+    "window_bg": "#1E1E20",
+    "card_bg": "#2C2C2E",
+    "card_border": "#3A3A3C",
+    "title": "#F5F5F7",
+    "card_title": "#AEAEB2",
+    "label": "#E5E5EA",
+    "subtext": "#98989D",
+    "accent": "#0A84FF",
+    "accent_h": "#409CFF",
+    "green": "#30D158",
+    "green_h": "#3DD964",
+    "orange": "#FF9F0A",
+    "red": "#FF453A",
+    "red_h": "#FF6961",
+    "hue_border": "#48484A",
+    "gray_bg": "#3A3A3C",
+    "gray_bg_h": "#48484A",
+    "gray_disabled": "#3A3A3C",
+    "gray_disabled_fg": "#AEAEB2",
+    # 深色底上用近黑文字，浅色底上用白色文字，保证对比度
+    "on_accent": "#FFFFFF",
+    # 亮蓝底 #0A84FF 配白字仅 3.65，改深字达 4.51
+    "on_accent_btn": "#0B1F3D",
+    "on_accent_btn_h": "#0B1F3D",
+    # 暗色下绿底 #30D158 亮度更高，深字可达 8.32:1
+    "on_light_btn": "#0B3D1E",
+    "on_light_btn_h": "#0B3D1E",
+    "on_red_btn": "#3D0A06",
+    "on_red_btn_h": "#3D0A06",
+    "neutral_btn": "#5A5A5E",
+    "neutral_btn_h": "#6E6E73",
+    "entry_bg": "#1C1C1E",
+    "preview_bg": "#141416",
+    # 覆盖层标记在深色截图上需要更亮的描边
+    "mark_red": "#FF453A",
+    "mark_on_red": "#FFFFFF",
+    "mark_yellow": "#FFD60A",
+    "mark_cyan": "#64D2FF",
+}
+
+CURRENT_THEME = THEME_LIGHT
+
+
+def detect_system_theme():
+    """
+    读取系统外观设置，返回 THEME_LIGHT / THEME_DARK。
+
+    优先走 CFPreferences：进程内读取，无需 fork `defaults`，适合高频轮询。
+    读取前必须先AppSynchronize，否则拿到的可能是进程启动时缓存的值。
+    个别环境（如未链接 CoreFoundation 的精简解释器）不可用时退回
+    `defaults read`，两条路径失败都按浅色处理。
+    """
+    # 浅色模式下 AppleInterfaceStyle 这个 key 根本不存在，
+    # CFPreferencesCopyAppValue 返回 None 即代表浅色。
+    try:
+        Quartz.CFPreferencesAppSynchronize("kCFPreferencesCurrentUser")
+        val = Quartz.CFPreferencesCopyAppValue(
+            "AppleInterfaceStyle", "kCFPreferencesCurrentUser")
+        return THEME_DARK if str(val).strip().lower() == "dark" else THEME_LIGHT
+    except Exception:
+        pass
+    try:
+        res = subprocess.run(
+            ["defaults", "read", "-g", "AppleInterfaceStyle"],
+            capture_output=True, text=True, timeout=2)
+        if res.returncode == 0 and res.stdout.strip().lower() == "dark":
+            return THEME_DARK
+    except Exception:
+        pass
+    return THEME_LIGHT
+
+
+def detect_running_from_dmg():
+    """
+    检测当前是否从 DMG 挂载卷（/Volumes/...）运行。
+
+    macOS 的 TCC 权限（辅助功能 / 屏幕录制）按「完整路径 + 代码签名」
+    匹配授权记录。从只读 DMG 卷运行 app 有两大问题：
+      1. 挂载路径不稳定——重复挂载会变成 /Volumes/PixelTrigger 1、
+         /Volumes/PixelTrigger 2 ...，路径一变授权立即失效；
+      2. 部分系统对从只读卷运行的程序拒绝写入 TCC 记录。
+    因此必须引导用户把 app 拖到「应用程序」目录再运行。
+
+    定位 app 真实位置时优先用 CFBundleGetMainBundle()（打包成 .app 后
+    权威）；源码运行（无 bundle）时退回 sys.executable。
+    """
+    # 1) 打包成 .app 后：从 main bundle 拿真实路径
+    try:
+        bundle = Quartz.CFBundleGetMainBundle()
+        if bundle:
+            url = Quartz.CFBundleCopyBundleURL(bundle)
+            path = Quartz.CFURLCopyFileSystemPath(url, 0)
+            if path:
+                return str(path).startswith("/Volumes/")
+    except Exception:
+        pass
+    # 2) 源码运行（无 bundle）：退回解释器路径
+    try:
+        exe = os.path.realpath(sys.executable)
+    except Exception:
+        exe = sys.executable
+    return exe.startswith("/Volumes/")
+
+
+def apply_theme(theme):
+    """把调色板写入模块级常量，供所有控件读取。"""
+    global CURRENT_THEME
+    pal = DARK_PALETTE if theme == THEME_DARK else LIGHT_PALETTE
+    CURRENT_THEME = theme
+    globals().update({
+        "C_WINDOW_BG": pal["window_bg"],
+        "C_CARD_BG": pal["card_bg"],
+        "C_CARD_BORDER": pal["card_border"],
+        "C_TITLE": pal["title"],
+        "C_CARD_TITLE": pal["card_title"],
+        "C_LABEL": pal["label"],
+        "C_SUBTEXT": pal["subtext"],
+        "C_ACCENT": pal["accent"],
+        "C_ACCENT_H": pal["accent_h"],
+        "C_GREEN": pal["green"],
+        "C_GREEN_H": pal["green_h"],
+        "C_ORANGE": pal["orange"],
+        "C_RED": pal["red"],
+        "C_RED_H": pal["red_h"],
+        "C_HUE_BORDER": pal["hue_border"],
+        "C_GRAY_BG": pal["gray_bg"],
+        "C_GRAY_BG_H": pal["gray_bg_h"],
+        "C_GRAY_DISABLED": pal["gray_disabled"],
+        "C_GRAY_DISABLED_FG": pal["gray_disabled_fg"],
+        "C_ON_ACCENT": pal["on_accent"],
+        "C_ON_LIGHT_BTN": pal["on_light_btn"],
+        "C_ON_RED_BTN": pal["on_red_btn"],
+        "C_ON_RED_BTN_H": pal["on_red_btn_h"],
+        "C_ON_LIGHT_BTN_H": pal["on_light_btn_h"],
+        "C_ON_ACCENT_BTN": pal["on_accent_btn"],
+        "C_ON_ACCENT_BTN_H": pal["on_accent_btn_h"],
+        "C_NEUTRAL_BTN": pal["neutral_btn"],
+        "C_NEUTRAL_BTN_H": pal["neutral_btn_h"],
+        "C_ENTRY_BG": pal["entry_bg"],
+        "C_PREVIEW_BG": pal["preview_bg"],
+        "C_MARK_RED": pal["mark_red"],
+        "C_MARK_ON_RED": pal["mark_on_red"],
+        "C_MARK_YELLOW": pal["mark_yellow"],
+        "C_MARK_CYAN": pal["mark_cyan"],
+    })
+    return pal
 
 
 class FancyButton:
     def __init__(self, parent, text, bg_normal, bg_hover,
                  bg_disabled, fg_normal, fg_disabled,
-                 command, font_size=12, padx=18, pady=7):
+                 command, font_size=12, padx=18, pady=7,
+                 fg_hover=None):
         self.bg_normal = bg_normal
         self.bg_hover = bg_hover
         self.bg_disabled = bg_disabled
         self.fg_normal = fg_normal
         self.fg_disabled = fg_disabled
+        # hover 底色亮度可能与常态不同（如亮蓝 -> 更浅蓝），允许单独指定
+        # 文字色，否则 hover 时对比度会失配
+        self.fg_hover = fg_hover or fg_normal
         self.command = command
         self.enabled = True
         self.label = tk.Label(
@@ -156,11 +407,11 @@ class FancyButton:
 
     def _enter(self, e):
         if self.enabled:
-            self.label.configure(bg=self.bg_hover)
+            self.label.configure(bg=self.bg_hover, fg=self.fg_hover)
 
     def _leave(self, e):
         if self.enabled:
-            self.label.configure(bg=self.bg_normal)
+            self.label.configure(bg=self.bg_normal, fg=self.fg_normal)
 
     def _click(self, e):
         if self.enabled and self.command:
@@ -192,8 +443,15 @@ def capture_region(x, y, w, h):
     width = Quartz.CGImageGetWidth(cg)
     height = Quartz.CGImageGetHeight(cg)
     bpr = Quartz.CGImageGetBytesPerRow(cg)
+    # 关键：先把 CGImage 的像素数据完整拷贝到 Python bytes，之后
+    # CGImage/CFData 由 pyobjc 的引用计数自动释放即可。
+    # 注意不能手动 CGImageRelease(cg)：pyobjc 托管对象在 Python 侧
+    # __del__ 里还会再 release 一次，手动 release 会导致双重释放，
+    # 在打包环境（冻结 pyobjc + macOS 15）下直接 SIGSEGV 闪退。
     data = Quartz.CGDataProviderCopyData(Quartz.CGImageGetDataProvider(cg))
-    return Image.frombuffer("RGBA", (width, height), bytes(data),
+    buf = bytes(data)
+    del data
+    return Image.frombuffer("RGBA", (width, height), buf,
                             "raw", "BGRA", bpr, 1).convert("RGB")
 
 
@@ -300,12 +558,42 @@ def match_precise(r, g, b, r0, g0, b0, tol):
     return (abs(r - r0) <= tol and abs(g - g0) <= tol and abs(b - b0) <= tol)
 
 
-def scan_region(img, matcher, mc, sample_step):
+def scan_region(img, matcher, mc, sample_step, target=None):
     w, h = img.size
-    pixels = img.load()
-    count = 0
-    y = 0
     step = max(1, sample_step)
+    count = 0
+    # 热路径优化：当提供 target=(r0,g0,b0,tol) 时（loop 中的唯一用法），
+    # 直接将 RGB 数据读入内存视图逐行扫描，避免每像素一次 img.load()
+    # 字典查找与 matcher 函数调用开销。否则回退到通用逐像素 matcher。
+    if target is not None:
+        r0, g0, b0, tol = target
+        try:
+            raw = img.tobytes("raw", "RGB")
+        except Exception:
+            raw = None
+        if raw is not None:
+            view = memoryview(raw)
+            row_bytes = w * 3
+            y = 0
+            while y < h:
+                row = view[y * row_bytes:(y + 1) * row_bytes]
+                i = 0
+                while i < row_bytes:
+                    r = row[i]
+                    g = row[i + 1]
+                    b = row[i + 2]
+                    if (r - r0 if r >= r0 else r0 - r) <= tol and \
+                       (g - g0 if g >= g0 else g0 - g) <= tol and \
+                       (b - b0 if b >= b0 else b0 - b) <= tol:
+                        count += 1
+                        if count >= mc:
+                            return count
+                    i += 3
+                y += step
+            return count
+    # 通用回退路径
+    pixels = img.load()
+    y = 0
     while y < h:
         for x in range(w):
             r, g, b = pixels[x, y]
@@ -372,10 +660,10 @@ class ToolTip:
             tw.attributes("-topmost", True)
         except Exception:
             pass
-        tk.Label(tw, text=self.text, bg="#F5F5F7", fg="#1D1D1F",
+        tk.Label(tw, text=self.text, bg=C_PREVIEW_BG, fg=C_TITLE,
                  font=("Helvetica Neue", 11), justify="left", anchor="w",
                  padx=14, pady=10, wraplength=280,
-                 highlightbackground="#C8C8CC",
+                 highlightbackground=C_HUE_BORDER,
                  highlightthickness=1).pack()
         tw.update_idletasks()
         tw.wm_geometry(f"+{x}+{y}")
@@ -416,9 +704,37 @@ class PixelTriggerApp:
         self.has_screen = False
         self.has_ax = None
         self.perm_job = None
+        # 记录上一次权限状态，用于检测「授权状态变化」并提示用户
+        self._last_screen_perm = None
+        self._last_ax_perm = None
+        self._perm_notified = {"screen": False, "ax": False}
+
+        self.theme_job = None
+        # 主题重建期间挂起一切对外交互，避免在半成品UI 上操作
+        self._rebuilding = False
+        # 全屏覆盖层（框选 / 取色器）是否正在显示
+        self._overlay_open = False
+        # 记录已经打进日志的主题切换，避免同一次切换刷屏
+        self._last_logged_theme = CURRENT_THEME
 
         self._close_dialog_open = False
         self._key_capture_open = False
+        # ============================================================
+        # 线程安全的 UI 派发队列
+        #
+        # 后台监控线程（loop / smooth_scroll / send_key_combo）绝不能
+        # 直接调用 Tk 的 after / configure / set 等方法。Tk（Tcl）解释器
+        # 非线程安全：后台线程与主线程事件循环并发操作 Tcl 解释器，会在
+        # 主线程销毁控件树（关闭窗口、主题重建）时访问到已释放的 Tcl
+        # 命令对象，表现为 Tcl_EvalObjv 里访问非法地址(如 0x23)而 SIGSEGV。
+        #
+        # 方案：后台线程只把「要执行的 UI 动作」塞进线程安全队列，由
+        # 主线程用一个 after 轮询器统一取出并执行。这样所有 Tk 调用都
+        # 只发生在主线程，从根本上消除竞态。
+        # ============================================================
+        self._ui_queue = queue.Queue()
+        self._closing = False
+        self._ui_poll_job = None
         self._donation_window = None
         self._hue_borders = []
         self.key_combo_str = "Next"
@@ -445,8 +761,50 @@ class PixelTriggerApp:
         self._initial_snapshot = self._snapshot_all()
 
         self._tick_permissions()
+        self._tick_theme()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(10, self._fit_and_center)
+
+        # 启动时若检测到从 DMG 卷运行，弹窗强提示——这是权限红点的最常见根因。
+        # 用户从 DMG 直接双击运行，挂载路径不稳定（重复挂载变 /Volumes/xxx 1），
+        # 且系统拒绝给只读卷程序写 TCC 记录，导致授权永远不生效。
+        if detect_running_from_dmg():
+            self.root.after(600, self._warn_running_from_dmg)
+
+        # 启动 UI 派发队列轮询器：主线程周期性取出后台线程塞入的
+        # UI 动作并执行。轮询间隔短，保证预览刷新、日志、倒计时等
+        # 反馈的实时性。
+        self._ui_poll_job = self.root.after(UI_POLL_MS, self._drain_ui_queue)
+
+    def _post_ui(self, fn, *args):
+        """线程安全地把一个 UI 动作交给主线程执行。
+
+        后台线程只能通过本方法间接更新界面；主线程也可直接调用。
+        """
+        if self._closing:
+            return
+        try:
+            self._ui_queue.put_nowait((fn, args))
+        except Exception:
+            pass
+
+    def _drain_ui_queue(self):
+        """主线程轮询器：取出队列里所有待执行的 UI 动作并执行。"""
+        if self._closing:
+            return
+        # 一次性取完当前积压的动作，避免高频刷新时队列越积越深。
+        try:
+            while True:
+                fn, args = self._ui_queue.get_nowait()
+                try:
+                    fn(*args)
+                except Exception:
+                    # 单个动作失败不应拖垮整个队列（例如目标 widget
+                    # 已销毁，触发 TclError）。
+                    pass
+        except queue.Empty:
+            pass
+        self._ui_poll_job = self.root.after(UI_POLL_MS, self._drain_ui_queue)
 
     def _fit_and_center(self):
         try:
@@ -465,15 +823,50 @@ class PixelTriggerApp:
         except Exception:
             pass
 
+    def _warn_running_from_dmg(self):
+        """从 DMG 卷运行时的启动强提示，引导用户正确安装。"""
+        try:
+            messagebox.showwarning(
+                "请先安装到「应用程序」",
+                "检测到 PixelTrigger 正从 DMG 磁盘映像直接运行。\n\n"
+                "这种方式无法稳定获得「辅助功能」和「屏幕录制」权限，"
+                "会导致权限圆点一直显示红色。\n\n"
+                "请把 PixelTrigger 拖到「应用程序」文件夹，\n"
+                "然后从应用程序里打开，再在系统设置中重新勾选权限。",
+                parent=self.root)
+        except Exception:
+            pass
+
+    # 数值类配置字段（用于类型校验，避免外部篡改导致异常）
+    _NUMERIC_KEYS = {
+        "x", "y", "w", "h", "br", "bg", "mb", "mc", "it", "cd",
+        "sample_step", "hue_r", "hue_g", "hue_b", "hue_tol",
+        "precise_r", "precise_g", "precise_b", "precise_tol",
+        "total_pixels", "duration", "key_repeat_count",
+        "key_repeat_interval", "key_hold_duration",
+    }
+
     def load_config(self):
         cfg = dict(DEFAULT_CONFIG)
         if os.path.exists(CONFIG_FILE):
             try:
                 with open(CONFIG_FILE) as f:
                     saved = json.load(f)
+                if not isinstance(saved, dict):
+                    return cfg
                 for k in cfg:
-                    if k in saved:
-                        cfg[k] = str(saved[k])
+                    if k not in saved:
+                        continue
+                    val = saved[k]
+                    if k in self._NUMERIC_KEYS:
+                        try:
+                            # 数值字段校验：仅接受可解析为数字的标量
+                            cfg[k] = str(float(val))
+                        except (TypeError, ValueError):
+                            # 非法值（数组/对象/非数字）回退到默认值
+                            continue
+                    else:
+                        cfg[k] = str(val)
             except Exception:
                 pass
         return cfg
@@ -584,7 +977,7 @@ class PixelTriggerApp:
         def mk_perm(text):
             f = tk.Frame(perm_area, bg=C_WINDOW_BG, cursor="hand2")
             dot = tk.Label(f, text="●", bg=C_WINDOW_BG,
-                           font=("Helvetica Neue", 11), fg="#B0B0B0")
+                           font=("Helvetica Neue", 11), fg=C_GRAY_DISABLED_FG)
             dot.pack(side="left", padx=(0, 4))
             lbl = tk.Label(f, text=text, bg=C_WINDOW_BG, fg=C_LABEL,
                            font=("Helvetica Neue", 11))
@@ -601,7 +994,7 @@ class PixelTriggerApp:
         for w in (self.ax_perm_frame, self.ax_perm_dot, self.ax_perm_lbl):
             w.bind("<Button-1>", lambda e: self.open_ax_settings())
 
-        tk.Frame(right, bg="#C7C7CC", width=1, height=24).pack(
+        tk.Frame(right, bg=C_HUE_BORDER, width=1, height=24).pack(
             side="right", padx=(16, 0), pady=6)
 
         buttons_area = tk.Frame(right, bg=C_WINDOW_BG)
@@ -610,7 +1003,8 @@ class PixelTriggerApp:
         self.start_btn = FancyButton(
             buttons_area, "▶   开始监控",
             bg_normal=C_GREEN, bg_hover=C_GREEN_H,
-            bg_disabled=C_GRAY_DISABLED, fg_normal="#FFFFFF",
+            bg_disabled=C_GRAY_DISABLED,
+            fg_normal=C_ON_LIGHT_BTN, fg_hover=C_ON_LIGHT_BTN_H,
             fg_disabled=C_GRAY_DISABLED_FG,
             command=self.start)
         self.start_btn.pack(side="left", padx=(0, 8))
@@ -618,7 +1012,8 @@ class PixelTriggerApp:
         self.stop_btn = FancyButton(
             buttons_area, "■   停止",
             bg_normal=C_RED, bg_hover=C_RED_H,
-            bg_disabled=C_GRAY_DISABLED, fg_normal="#FFFFFF",
+            bg_disabled=C_GRAY_DISABLED,
+            fg_normal=C_ON_RED_BTN, fg_hover=C_ON_RED_BTN_H,
             fg_disabled=C_GRAY_DISABLED_FG,
             command=self.stop)
         self.stop_btn.pack(side="left")
@@ -697,11 +1092,13 @@ class PixelTriggerApp:
         btns = tk.Frame(dlg, bg=C_WINDOW_BG)
         btns.pack(pady=(0, 18))
 
-        close_btn = tk.Label(btns, text="关闭", bg=C_ACCENT, fg="#FFFFFF",
-                              font=("Helvetica Neue", 11, "bold"),
-                              padx=20, pady=6, cursor="pointinghand")
-        close_btn.bind("<Enter>", lambda e: close_btn.configure(bg=C_ACCENT_H))
-        close_btn.bind("<Leave>", lambda e: close_btn.configure(bg=C_ACCENT))
+        close_btn = tk.Label(btns, text="关闭", bg=C_ACCENT, fg=C_ON_ACCENT_BTN,
+                             font=("Helvetica Neue", 11, "bold"),
+                             padx=20, pady=6, cursor="pointinghand")
+        close_btn.bind("<Enter>", lambda e: close_btn.configure(
+            bg=C_ACCENT_H, fg=C_ON_ACCENT_BTN_H))
+        close_btn.bind("<Leave>", lambda e: close_btn.configure(
+            bg=C_ACCENT, fg=C_ON_ACCENT_BTN))
         close_btn.bind("<Button-1>", lambda e: close_donation())
         close_btn.pack()
 
@@ -740,11 +1137,11 @@ class PixelTriggerApp:
         st.pack(fill="x")
         self.status_dot = tk.Label(st, text="●", bg=C_CARD_BG,
                                      font=("Helvetica Neue", 20),
-                                     fg="#B0B0B0")
+                                     fg=C_GRAY_DISABLED_FG)
         self.status_dot.pack(side="left", padx=(0, 8))
         self.status_var = tk.StringVar(value="未运行")
         self.status_label = tk.Label(st, textvariable=self.status_var,
-                                       bg=C_CARD_BG, fg="#8E8E93",
+                                       bg=C_CARD_BG, fg=C_SUBTEXT,
                                        font=("Helvetica Neue", 22, "bold"),
                                        anchor="w")
         self.status_label.pack(side="left")
@@ -812,7 +1209,7 @@ class PixelTriggerApp:
         pr1.pack(fill="x", pady=(8, 6))
         ttk.Button(pr1, text="💧  屏幕取色",
                     command=self.start_eyedrop).pack(side="left", ipady=1)
-        self.base_color_box = tk.Label(pr1, text="  ", bg="#0000c9",
+        self.base_color_box = tk.Label(pr1, text="  ", bg=C_ENTRY_BG,
                                         width=4, height=1,
                                         highlightbackground=C_HUE_BORDER,
                                         highlightthickness=1)
@@ -927,7 +1324,7 @@ class PixelTriggerApp:
         self.key_display_var = tk.StringVar(
             value=format_key_display(self.key_combo_str))
         tk.Label(kr1, textvariable=self.key_display_var,
-                 bg="#F5F5F7", fg=C_TITLE,
+                 bg=C_PREVIEW_BG, fg=C_TITLE,
                  font=("Menlo", 11, "bold"),
                  padx=10, pady=4,
                  highlightbackground=C_HUE_BORDER,
@@ -968,15 +1365,15 @@ class PixelTriggerApp:
         outer, b = self._make_card(parent, "监控区域预览")
         outer.grid(row=0, column=1, sticky="nsew")
 
-        preview_box = tk.Frame(b, bg="#F5F5F7",
-                               highlightbackground="#E2E2E2",
+        preview_box = tk.Frame(b, bg=C_PREVIEW_BG,
+                               highlightbackground=C_CARD_BORDER,
                                highlightthickness=1,
                                width=1, height=1)
         preview_box.pack(fill="both", expand=True)
         preview_box.pack_propagate(False)
 
         self.preview_label = tk.Label(preview_box, text="（未运行）",
-                                       bg="#F5F5F7", fg=C_SUBTEXT,
+                                       bg=C_PREVIEW_BG, fg=C_SUBTEXT,
                                        font=("Helvetica Neue", 11))
         self.preview_label.pack(fill="both", expand=True)
 
@@ -1020,8 +1417,13 @@ class PixelTriggerApp:
             font=("Menlo", 10),
             relief="flat", bd=0,
             highlightthickness=1,
-            highlightbackground="#E2E2E2",
-            bg="#FFFFFF")
+            highlightbackground=C_CARD_BORDER,
+            # 必须显式给 fg：ScrolledText 默认取 systemTextColor，
+            # 它跟随「系统」外观而非本应用调色板。深色系统下配深色底
+            # 尚可读，但一旦系统外观与应用主题不同步就会撞色。
+            bg=C_ENTRY_BG, fg=C_SUBTEXT,
+            insertbackground=C_SUBTEXT,
+            selectbackground=C_ACCENT, selectforeground=C_ON_ACCENT_BTN)
         self.log.pack(fill="both", expand=True)
 
     def _on_mode_change(self):
@@ -1117,16 +1519,16 @@ class PixelTriggerApp:
             new_cd = float(self.vars["cd"].get())
         except Exception:
             return
+        # cd 为 0 或负值时视为「无冷却」，交给 loop 线程裁决退出，
+        # 这里不做任何状态写入，避免与 loop 线程的时钟打架。
+        if new_cd < 0.001:
+            return
         if abs(new_cd - self.current_cd) < 0.001:
             return
+        # 用户冷却期间改了 cd：仅更新「冷却结束时间点」，让 loop
+        # 线程按新的时长继续倒计时，而不在主线程裁决结束/清标志。
         self.current_cd = new_cd
-        elapsed = time.time() - self.cooldown_start
-        if elapsed >= new_cd:
-            self.in_cooldown = False
-            self.cooldown_until = 0
-            self.root.after(0, self._on_cooldown_end)
-        else:
-            self.cooldown_until = self.cooldown_start + new_cd
+        self.cooldown_until = self.cooldown_start + new_cd
 
     def open_key_capture(self):
         if self._key_capture_open:
@@ -1152,7 +1554,7 @@ class PixelTriggerApp:
 
         status_var = tk.StringVar(value="⌨️  等待按键…")
         status_label = tk.Label(dlg, textvariable=status_var,
-                                 bg="#F5F5F7", fg=C_ACCENT,
+                                 bg=C_PREVIEW_BG, fg=C_ACCENT,
                                  font=("Menlo", 16, "bold"),
                                  padx=18, pady=12,
                                  highlightbackground=C_HUE_BORDER,
@@ -1191,10 +1593,10 @@ class PixelTriggerApp:
 
             if keysym in MODIFIER_KEYSYMS:
                 mods = []
-                if flags & 0x0010: mods.append("cmd")
-                if flags & 0x0008: mods.append("opt")
-                if flags & 0x0004: mods.append("ctrl")
-                if flags & 0x0001: mods.append("shift")
+                if flags & FLAG_MASK_CMD: mods.append("cmd")
+                if flags & FLAG_MASK_OPT: mods.append("opt")
+                if flags & FLAG_MASK_CTRL: mods.append("ctrl")
+                if flags & FLAG_MASK_SHIFT: mods.append("shift")
                 if mods:
                     s = "".join(MOD_SYMBOL.get(m, m) for m in mods)
                     status_var.set(f"{s}  …  再按一个键")
@@ -1203,10 +1605,10 @@ class PixelTriggerApp:
 
             main = keysym.lower() if len(keysym) == 1 and keysym.isalpha() else keysym
             mods = []
-            if flags & 0x0010: mods.append("cmd")
-            if flags & 0x0008: mods.append("opt")
-            if flags & 0x0004: mods.append("ctrl")
-            if flags & 0x0001: mods.append("shift")
+            if flags & FLAG_MASK_CMD: mods.append("cmd")
+            if flags & FLAG_MASK_OPT: mods.append("opt")
+            if flags & FLAG_MASK_CTRL: mods.append("ctrl")
+            if flags & FLAG_MASK_SHIFT: mods.append("shift")
 
             if main == "Escape" and not mods:
                 status_var.set("已取消")
@@ -1238,7 +1640,7 @@ class PixelTriggerApp:
     def start_eyedrop(self):
         state = {"done": False, "gx": 0, "gy": 0}
         try:
-            err, ids, count = Quartz.CGGetActiveDisplayList(16, None, None)
+            err, ids, count = Quartz.CGGetActiveDisplayList(MAX_DISPLAYS, None, None)
         except Exception:
             return
         if not ids:
@@ -1251,6 +1653,7 @@ class PixelTriggerApp:
         overlays = []
 
         def destroy_all():
+            self._overlay_open = False
             for o in overlays:
                 try:
                     o.destroy()
@@ -1261,6 +1664,7 @@ class PixelTriggerApp:
             except Exception:
                 pass
 
+        self._overlay_open = True
         self.root.bind_all("<Escape>", lambda e: destroy_all())
 
         def pick():
@@ -1293,9 +1697,9 @@ class PixelTriggerApp:
             c = tk.Canvas(ov, bg="black", highlightthickness=0,
                           cursor="crosshair", width=sw, height=sh)
             c.pack(fill="both", expand=True)
-            ch = c.create_line(0, 0, 0, 0, fill="#ff3b30", width=1)
-            cv = c.create_line(0, 0, 0, 0, fill="#ff3b30", width=1)
-            ring = c.create_oval(0, 0, 0, 0, outline="#ffffff", width=2)
+            ch = c.create_line(0, 0, 0, 0, fill=C_MARK_RED, width=1)
+            cv = c.create_line(0, 0, 0, 0, fill=C_MARK_RED, width=1)
+            ring = c.create_oval(0, 0, 0, 0, outline=C_MARK_ON_RED, width=2)
 
             def motion(canvas=c, ch_=ch, cv_=cv, ring_=ring, w_=sw, h_=sh):
                 def _m(e):
@@ -1339,7 +1743,229 @@ class PixelTriggerApp:
         except Exception:
             return None
 
+    def _request_screen_perm(self):
+        """
+        主动请求屏幕录制权限，触发系统授权弹窗。
+
+        macOS 的机制：应用必须调用 CGRequestScreenCaptureAccess() 才会弹出
+        系统授权框；用户同意后，「隐私与安全 → 屏幕录制」里才会出现该应用
+        的条目。只做 CGPreflightScreenCaptureAccess()（检测）永远不会弹窗，
+        设置里也就永远没有这个条目——这正是用户遇到的「跳过去没有条目」。
+        """
+        try:
+            return bool(Quartz.CGRequestScreenCaptureAccess())
+        except Exception:
+            return False
+
+    def _request_ax_perm(self):
+        """
+        主动请求辅助功能权限，触发系统授权弹窗。
+
+        用 AXIsProcessTrustedWithOptions 并带 kAXTrustedCheckOptionPrompt=True
+        来强制弹窗。若该 API 不可用则退回 AXIsProcessTrusted()（只检测）。
+        """
+        if AXIsProcessTrustedWithOptions is None:
+            return self._check_ax_perm()
+        try:
+            return bool(AXIsProcessTrustedWithOptions(
+                {"AXTrustedCheckOptionPrompt": True}))
+        except Exception:
+            return self._check_ax_perm()
+
     def _tick_permissions(self):
+        self._tick_permissions_once()
+        self.perm_job = self.root.after(PERM_CHECK_MS, self._tick_permissions)
+
+    # ============================================================
+    # 系统外观（浅色/ 深色）监听
+    #
+    # 难点：所有颜色在控件构造时就被写死进bg/fg，事后改模块常量对
+    # 已存在的控件无效。因此切换主题只能销毁并重建整棵界面树，
+    # 同时把用户当前的输入、运行状态、日志、预览图原样搬回去。
+    # ============================================================
+    def _theme_busy(self):
+        """
+        主题重建期间不能有模态/ 覆盖层窗口存在。
+
+        框选、取色器都是全屏透明覆盖层并带wait_window 阻塞，
+        捐赠窗与按键捕获窗则grab_set 了输入；此时重建主界面会
+        打断它们，因此一律推迟到它们关闭后再切。
+        """
+        return bool(self._donation_window is not None
+                    or self._key_capture_open
+                    or self._close_dialog_open
+                    or getattr(self, "_overlay_open", False))
+
+    def _tick_theme(self):
+        if self._rebuilding:
+            self.theme_job = self.root.after(THEME_POLL_MS, self._tick_theme)
+            return
+        try:
+            now = detect_system_theme()
+            if now != CURRENT_THEME:
+                if not self._theme_busy():
+                    self._rebuild_for_theme(now)
+                # 忙碌时静默跳过：下一次轮询会重新比对，
+                # 覆盖层一关就会自动补上切换。
+        except Exception:
+            pass
+        self.theme_job = self.root.after(THEME_POLL_MS, self._tick_theme)
+
+    def _capture_ui_state(self):
+        """把界面上的动态状态抽成可序列化的 dict，供重建后还原。"""
+        state = {}
+        try:
+            for k, v in self.vars.items():
+                try:
+                    state["var:" + k] = str(v.get())
+                except Exception:
+                    pass
+            state["color_mode"] = self.color_mode.get()
+            state["trigger_mode"] = self.trigger_mode.get()
+            state["scroll_dir"] = self.scroll_dir.get()
+            state["key_action"] = self.key_action.get()
+            state["key_combo"] = self.key_combo_str
+            state["hue"] = tuple(self.selected_hue)
+            state["hue_tol"] = int(self.hue_tol)
+        except Exception:
+            pass
+        # 运行期状态：重建后要继续跑，而不是变回"未运行"
+        state["running"] = self.running
+        state["status"] = self.status_var.get()
+        state["match"] = self.match_var.get()
+        state["in_cooldown"] = self.in_cooldown
+        try:
+            state["log"] = self.log.get("1.0", "end-1c")
+        except Exception:
+            state["log"] = ""
+        return state
+
+    def _restore_ui_state(self, state):
+        """把 _capture_ui_state 抓到的状态写回新建的控件。"""
+        try:
+            for k, v in self.vars.items():
+                key = "var:" + k
+                if key in state:
+                    try:
+                        v.set(state[key])
+                    except Exception:
+                        pass
+            self.color_mode.set(state.get("color_mode", "hue"))
+            self.trigger_mode.set(state.get("trigger_mode", "scroll"))
+            self.scroll_dir.set(state.get("scroll_dir", "up"))
+            self.key_action.set(state.get("key_action", "press"))
+            self.key_combo_str = state.get("key_combo", "Next")
+            h = state.get("hue")
+            if h:
+                self.selected_hue = tuple(h)
+            self.hue_tol = int(state.get("hue_tol", HUE_DEFAULT_TOL))
+        except Exception:
+            pass
+
+        # 面板显隐要按还原后的模式重新计算一次
+        try:
+            self._on_mode_change()
+            self._on_trigger_mode_change()
+            self._refresh_hue_borders()
+        except Exception:
+            pass
+
+        # 日志
+        try:
+            text = state.get("log", "")
+            if text:
+                self.log.configure(state="normal")
+                self.log.insert("1.0", text)
+                self.log.see("end")
+                self.log.configure(state="disabled")
+        except Exception:
+            pass
+
+        # 运行状态：按钮可用性与状态灯颜色要一并还原，
+        # 否则会出现「日志说在跑但停止按钮是灰的」这种不一致。
+        try:
+            self.match_var.set(state.get("match", "匹配像素：—"))
+            self.status_var.set(state.get("status", "未运行"))
+            if state.get("running"):
+                self.start_btn.set_enabled(False)
+                self.stop_btn.set_enabled(True)
+                fg = C_ORANGE if state.get("in_cooldown") else C_GREEN
+                self.status_label.configure(fg=fg)
+                self.status_dot.configure(fg=fg)
+            else:
+                self.start_btn.set_enabled(True)
+                self.stop_btn.set_enabled(False)
+                self.status_label.configure(fg=C_SUBTEXT)
+                self.status_dot.configure(fg=C_GRAY_DISABLED_FG)
+        except Exception:
+            pass
+
+        try:
+            self._update_live()
+        except Exception:
+            pass
+
+        # 冷却标记必须在 _update_live 之后回写：_update_live 会触发
+        # _maybe_adjust_cooldown，若 cd 被改过，它可能把冷却判定为已结束
+        # 并顺手清掉 in_cooldown。回写顺序放在后面，状态才与界面一致。
+        if state.get("in_cooldown"):
+            self.in_cooldown = True
+
+    def _rebuild_for_theme(self, theme):
+        """
+        切换调色板并重建界面。
+
+        顺序很关键：必须先把状态抓下来（此时控件还活着的旧配色），
+        再销毁重建，最后还原；顺序颠倒会丢参数。
+        """
+        state = self._capture_ui_state()
+        # 快照基线要跟着一起重置：重建后的控件集合与初始时不同，
+        # 若沿用旧基线会把「主题切换」误判成「用户改了参数」，
+        # 退出时凭空弹出保存对话框。
+        self._rebuilding = True
+        try:
+            # 预热预览图引用，避免销毁父widget 时被GC 连带回收
+            old_preview = self.preview_image
+            apply_theme(theme)
+            for child in self.root.winfo_children():
+                try:
+                    child.destroy()
+                except Exception:
+                    pass
+            # _build_ui 会重置 vars 与 _hue_borders，先清干净
+            self.vars = {}
+            self._hue_borders = []
+            self.preview_image = None
+            self.root.configure(bg=C_WINDOW_BG)
+            self._build_ui()
+            self._restore_ui_state(state)
+            # 预览图在新label 上重新贴一次
+            if old_preview is not None:
+                try:
+                    self.preview_image = old_preview
+                    self.preview_label.configure(image=old_preview, text="")
+                except Exception:
+                    self.preview_image = None
+        finally:
+            self._rebuilding = False
+
+        # 权限圆点由 _tick_permissions 下一轮刷新，这里主动同步一次，
+        # 免得重建后有最长 1 秒显示成默认灰色
+        try:
+            self._tick_permissions_once()
+        except Exception:
+            pass
+        # 注意：刻意不重置 _initial_snapshot。它记录的是「启动时读到的配置」，
+        # 是退出时判断是否要提示保存的唯一依据。若在这里用重建后的控件
+        # 重新取一次基线，用户改过的参数会被当成没改过，退出时静默丢配置。
+
+        if theme != self._last_logged_theme:
+            self._last_logged_theme = theme
+            name = "深色" if theme == THEME_DARK else "浅色"
+            self.log_msg(f"🎨 已跟随系统切换到{name}外观")
+
+    def _tick_permissions_once(self):
+        """只刷新权限圆点颜色，不重新排定轮询。"""
         self.has_screen = self._check_screen_perm()
         self.has_ax = self._check_ax_perm()
         if self.has_screen:
@@ -1351,12 +1977,60 @@ class PixelTriggerApp:
         elif self.has_ax is False:
             self.ax_perm_dot.configure(fg=C_RED)
         else:
-            self.ax_perm_dot.configure(fg="#B0B0B0")
-        self.perm_job = self.root.after(PERM_CHECK_MS, self._tick_permissions)
+            self.ax_perm_dot.configure(fg=C_GRAY_DISABLED_FG)
+
+        # 权限状态发生变化时主动提示，而不是让用户对着红点猜。
+        # 关键场景：ad-hoc 签名 + 重新打包 → CDHash 变化 → TCC 里旧的
+        # 授权记录匹配不上，AXIsProcessTrusted 返回 False，但系统设置里
+        # 仍显示「已勾选」。此时只提示「重新勾选一次」即可恢复。
+        self._maybe_notify_perm_change()
+
+    def _maybe_notify_perm_change(self):
+        """权限状态变化时向用户提示，并给出针对性引导。"""
+        # 首次进入时仅记录基线，不提示
+        if self._last_screen_perm is None:
+            self._last_screen_perm = self.has_screen
+            self._last_ax_perm = self.has_ax
+            return
+
+        # 屏幕录制：从无到有
+        if self.has_screen and not self._last_screen_perm \
+                and not self._perm_notified["screen"]:
+            self._perm_notified["screen"] = True
+            self.log_msg("🟢 屏幕录制权限已生效")
+
+        # 辅助功能：从无到有
+        if self.has_ax is True and self._last_ax_perm is not True \
+                and not self._perm_notified["ax"]:
+            self._perm_notified["ax"] = True
+            self.log_msg("🟢 辅助功能权限已生效")
+
+        # 辅助功能：一直拿不到，但系统里可能已勾选（CDHash 不匹配的典型）
+        if self.has_ax is False and not self._perm_notified["ax"]:
+            # 仅提示一次，避免刷屏
+            self._perm_notified["ax"] = True
+            if detect_running_from_dmg():
+                self.log_msg(
+                    "🔴 辅助功能权限未生效：检测到正从 DMG 磁盘映像直接运行，"
+                    "这种运行方式无法稳定获得系统授权。请把 PixelTrigger 拖到"
+                    "「应用程序」目录后，从那里打开，再重新勾选权限。")
+            else:
+                self.log_msg(
+                    "🔴 辅助功能权限未生效：若系统设置里已勾选，请取消勾选后"
+                    "重新勾选一次（应用更新后签名变化会导致旧授权失效）")
+
+        self._last_screen_perm = self.has_screen
+        self._last_ax_perm = self.has_ax
 
     def open_screen_settings(self):
         if self.has_screen:
             return
+        # 先主动请求权限触发系统弹窗——这样「屏幕录制」里才会出现本应用条目。
+        # 请求后无论用户是否同意，再打开设置页让用户能直接勾选/添加。
+        try:
+            self._request_screen_perm()
+        except Exception:
+            pass
         try:
             subprocess.run(["open",
                 "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"],
@@ -1367,6 +2041,11 @@ class PixelTriggerApp:
     def open_ax_settings(self):
         if self.has_ax is True:
             return
+        # 同上：先请求权限触发弹窗，再打开设置页。
+        try:
+            self._request_ax_perm()
+        except Exception:
+            pass
         try:
             subprocess.run(["open",
                 "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"],
@@ -1377,7 +2056,7 @@ class PixelTriggerApp:
     def select_region(self):
         result = {"x": None, "y": None, "w": None, "h": None}
         try:
-            err, ids, count = Quartz.CGGetActiveDisplayList(16, None, None)
+            err, ids, count = Quartz.CGGetActiveDisplayList(MAX_DISPLAYS, None, None)
         except Exception as e:
             self.log_msg(f"⚠️ 无法获取显示器列表: {e}")
             return
@@ -1429,6 +2108,7 @@ class PixelTriggerApp:
                     c.itemconfig(c._d, state="hidden")
 
         def destroy():
+            self._overlay_open = False
             for o in overlays:
                 try:
                     o.destroy()
@@ -1439,6 +2119,7 @@ class PixelTriggerApp:
             except Exception:
                 pass
 
+        self._overlay_open = True
         self.root.bind_all("<Escape>", lambda e: destroy())
 
         def make(screen):
@@ -1507,10 +2188,10 @@ class PixelTriggerApp:
                     text="按住拖拽，或点击两次（左上角 → 右下角）   按 ESC 取消",
                     fill="white", font=("Helvetica Neue", 18, "bold"))
                 first = False
-            c._ch = c.create_line(0,0,0,0, fill="#ff3b30", width=1, state="hidden")
-            c._cv = c.create_line(0,0,0,0, fill="#ff3b30", width=1, state="hidden")
-            c._r = c.create_rectangle(0,0,0,0, outline="#ffee00", width=3, state="hidden")
-            c._d = c.create_oval(0,0,0,0, outline="#00e5ff", width=2, state="hidden")
+            c._ch = c.create_line(0,0,0,0, fill=C_MARK_RED, width=1, state="hidden")
+            c._cv = c.create_line(0,0,0,0, fill=C_MARK_RED, width=1, state="hidden")
+            c._r = c.create_rectangle(0,0,0,0, outline=C_MARK_YELLOW, width=3, state="hidden")
+            c._d = c.create_oval(0,0,0,0, outline=C_MARK_CYAN, width=2, state="hidden")
             m, p, r = make((sx, sy, sw, sh))
             c.bind("<Motion>", m)
             c.bind("<ButtonPress-1>", p)
@@ -1570,6 +2251,35 @@ class PixelTriggerApp:
     def start(self):
         if self.running:
             return
+        # 启动前主动检查权限，缺失时给出明确指引，而不是让用户
+        # 进入运行态后才发现截图/按键一直不生效。
+        self._tick_permissions_once()
+        if not self.has_screen:
+            # 主动请求屏幕录制权限，触发系统授权弹窗。
+            # 之前只做检测不请求，导致系统设置里永远没有本应用条目。
+            self.log_msg("🔴 尚未授予「屏幕录制」权限。正在请求系统授权…")
+            try:
+                granted = self._request_screen_perm()
+            except Exception:
+                granted = False
+            if granted:
+                self.has_screen = True
+                self.log_msg("🟢 屏幕录制权限已生效")
+            else:
+                self.log_msg("🔴 请在弹出的系统授权框中允许，或点击右上角红点授权。")
+                return
+        if self.has_ax is False:
+            # 主动请求辅助功能权限，触发系统授权弹窗（仅提示不阻断）。
+            self.log_msg("🔴 尚未授予「辅助功能」权限，正在请求系统授权…")
+            try:
+                self._request_ax_perm()
+            except Exception:
+                pass
+            if self._check_ax_perm() is True:
+                self.has_ax = True
+                self.log_msg("🟢 辅助功能权限已生效")
+            else:
+                self.log_msg("🔴 辅助功能权限仍缺失，按键/滚动触发将无法生效。")
         self._update_live()
         self.running = True
         self.stop_event.clear()
@@ -1605,8 +2315,8 @@ class PixelTriggerApp:
         self.start_btn.set_enabled(True)
         self.stop_btn.set_enabled(False)
         self.status_var.set("未运行")
-        self.status_label.configure(fg="#8E8E93")
-        self.status_dot.configure(fg="#B0B0B0")
+        self.status_label.configure(fg=C_SUBTEXT)
+        self.status_dot.configure(fg=C_GRAY_DISABLED_FG)
         self.match_var.set("匹配像素：—")
         self.log_msg("■ 已停止")
 
@@ -1614,17 +2324,17 @@ class PixelTriggerApp:
         if not self.running:
             self.countdown_job = None
             return
+        # 倒计时显示只负责「读」冷却剩余时间并刷新状态栏文字，
+        # 绝不裁决冷却是否结束。结束裁决权唯一地属于 loop 线程
+        # （它是唯一推进 in_cooldown / cooldown_until 的时钟），
+        # 否则两个时钟互相清状态会造成「一直显示冷却中 1 秒」。
         if self.cooldown_until > 0:
             remaining = self.cooldown_until - time.time()
             if remaining > 0:
-                secs = math.ceil(remaining)
+                secs = max(1, math.ceil(remaining))
                 self.status_var.set(f"冷却中 {secs} 秒")
                 self.status_label.configure(fg=C_ORANGE)
                 self.status_dot.configure(fg=C_ORANGE)
-            else:
-                self.cooldown_until = 0
-                self.in_cooldown = False
-                self._on_cooldown_end()
         self.countdown_job = self.root.after(
             COUNTDOWN_TICK_MS, self._start_countdown_ticker)
 
@@ -1658,12 +2368,19 @@ class PixelTriggerApp:
             self.log.configure(state="normal")
             ts = time.strftime("%H:%M:%S")
             self.log.insert("end", f"[{ts}] {msg}\n")
+            # 裁掉超出上限的历史，避免长时间运行后 ScrolledText
+            # 无限膨胀（异常分支每秒可写一条，跑一整天就是几万行）。
+            # 只在超量时动手，平时零开销。
+            # end-1c 指向末尾换行符之前，index 返回的是「末行行号」，
+            # 故实际行数 = 该值；再减 1 是为了让删除区间正好留上限行。
+            nlines = int(self.log.index("end-1c").split(".")[0])
+            if nlines > LOG_MAX_LINES:
+                self.log.delete("1.0", f"{nlines - LOG_MAX_LINES + 1}.0")
             self.log.see("end")
             self.log.configure(state="disabled")
-        try:
-            self.root.after(0, _do)
-        except Exception:
-            pass
+        # 统一走线程安全队列：log_msg 可能被主线程（start/stop）与
+        # 后台线程（loop）同时调用，都必须收口到主线程执行。
+        self._post_ui(_do)
 
     def loop(self):
         while self.running and not self.stop_event.is_set():
@@ -1674,7 +2391,7 @@ class PixelTriggerApp:
                 else:
                     self.in_cooldown = False
                     self.cooldown_until = 0
-                    self.root.after(0, self._on_cooldown_end)
+                    self._post_ui(self._on_cooldown_end)
 
             t0 = time.time()
             live = dict(self.live)
@@ -1718,25 +2435,25 @@ class PixelTriggerApp:
             if now >= self.preview_hold_until and \
                now - self.last_preview_time >= PREVIEW_INTERVAL:
                 self.last_preview_time = now
-                self.root.after(0, self.update_preview, img)
+                self._post_ui(self.update_preview, img)
 
             def matcher(r, g, b, _r0=r0, _g0=g0, _b0=b0, _t=tol):
                 return match_precise(r, g, b, _r0, _g0, _b0, _t)
             try:
-                count = scan_region(img, matcher, mc, step)
+                count = scan_region(img, matcher, mc, step, target=(r0, g0, b0, tol))
             except Exception as e:
                 self.log_msg(f"扫描出错：{e}")
                 count = 0
 
             frame_ms = int((time.time() - t0) * 1000)
             if self.running:
-                self.root.after(0, self._set_match_text,
-                                 f"匹配像素：{count}（帧耗时 {frame_ms} ms）")
+                self._post_ui(self._set_match_text,
+                               f"匹配像素：{count}（帧耗时 {frame_ms} ms）")
 
             if count >= mc:
                 self.last_preview_time = now
                 self.preview_hold_until = now + PREVIEW_HOLD_AFTER
-                self.root.after(0, self.update_preview, img)
+                self._post_ui(self.update_preview, img)
 
                 tm = live.get("trigger_mode", "scroll")
                 if tm == "scroll":
@@ -1779,7 +2496,7 @@ class PixelTriggerApp:
                     self.cooldown_until = self.cooldown_start + cd
                     self.current_cd = cd
                     self.in_cooldown = True
-                    self.root.after(0, self._on_enter_cooldown, cd)
+                    self._post_ui(self._on_enter_cooldown, cd)
 
             self.stop_event.wait(it)
 
@@ -1805,7 +2522,7 @@ class PixelTriggerApp:
         dx = rx + (rw - dw) // 2
         dy = ry + (rh - dh) // 2
         try:
-            err, ids, count = Quartz.CGGetActiveDisplayList(16, None, None)
+            err, ids, count = Quartz.CGGetActiveDisplayList(MAX_DISPLAYS, None, None)
             screens = []
             for did in ids:
                 r = Quartz.CGDisplayBounds(did)
@@ -1866,31 +2583,53 @@ class PixelTriggerApp:
 
         FancyButton(btns, "保存并退出",
                     bg_normal=C_ACCENT, bg_hover=C_ACCENT_H,
-                    bg_disabled=C_GRAY_DISABLED, fg_normal="#FFFFFF",
+                    bg_disabled=C_GRAY_DISABLED,
+                    fg_normal=C_ON_ACCENT_BTN, fg_hover=C_ON_ACCENT_BTN_H,
                     fg_disabled=C_GRAY_DISABLED_FG,
                     command=do_save, font_size=11).pack(side="left", padx=4)
         FancyButton(btns, "不保存直接退出",
-                    bg_normal="#6E6E73", bg_hover="#5A5A5E",
-                    bg_disabled=C_GRAY_DISABLED, fg_normal="#FFFFFF",
+                    bg_normal=C_NEUTRAL_BTN, bg_hover=C_NEUTRAL_BTN_H,
+                    bg_disabled=C_GRAY_DISABLED, fg_normal=C_ON_ACCENT,
+                    fg_hover=C_ON_ACCENT,
                     fg_disabled=C_GRAY_DISABLED_FG,
                     command=do_no_save, font_size=11).pack(side="left", padx=4)
         FancyButton(btns, "取消退出",
                     bg_normal=C_GRAY_BG, bg_hover=C_GRAY_BG_H,
                     bg_disabled=C_GRAY_DISABLED, fg_normal=C_TITLE,
+                    fg_hover=C_TITLE,
                     fg_disabled=C_GRAY_DISABLED_FG,
                     command=do_cancel, font_size=11).pack(side="left", padx=4)
 
     def _quit(self):
+        # 置关闭标志：后台线程再往队列塞 UI 动作会被直接丢弃，
+        # 轮询器也立即停止，杜绝销毁后再访问 Tk 对象导致的崩溃。
+        self._closing = True
+        if self._ui_poll_job:
+            try:
+                self.root.after_cancel(self._ui_poll_job)
+            except Exception:
+                pass
+            self._ui_poll_job = None
         if self.perm_job:
             try:
                 self.root.after_cancel(self.perm_job)
             except Exception:
                 pass
             self.perm_job = None
+        if self.theme_job:
+            try:
+                self.root.after_cancel(self.theme_job)
+            except Exception:
+                pass
+            self.theme_job = None
         self.root.destroy()
 
 
 if __name__ == "__main__":
+    # 主题必须在任何控件创建前应用：控件构造时会把当前的 C_* 常量
+    # 直接写入bg/fg，之后再改常量不会生效。
+    apply_theme(detect_system_theme())
+
     root = tk.Tk()
     try:
         root.tk.call("tk", "scaling", 1.2)
