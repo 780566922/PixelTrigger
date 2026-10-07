@@ -105,7 +105,8 @@ PYEOF
 # 最终只把成品 .app 复制回项目 dist/。
 STAGE="$(mktemp -d /tmp/pt-build.XXXXXX)"
 trap 'rm -rf "${STAGE}"' EXIT
-cp "${PROJECT_DIR}/color_watcher.py" "${PROJECT_DIR}/setup.py" \
+cp "${PROJECT_DIR}/color_watcher.py" "${PROJECT_DIR}/platform_backend.py" \
+   "${PROJECT_DIR}/setup.py" \
    "${PROJECT_DIR}/donation.png" "${PROJECT_DIR}/icon.icns" "${STAGE}/"
 
 echo "==> 运行 py2app（构建目录 ${STAGE}）"

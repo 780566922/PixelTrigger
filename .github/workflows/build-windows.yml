@@ -1,0 +1,54 @@
+name: Build Windows EXE
+
+# 在云端 Windows 机器上把 PixelTrigger 打包成单文件 exe。
+# macOS 上无法交叉编译 Windows 程序（PyInstaller 不支持），故用 CI 产出。
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller Pillow
+
+      - name: Syntax check
+        run: python -m py_compile color_watcher.py platform_backend.py
+
+      - name: Build EXE
+        run: pyinstaller --noconfirm --clean --onefile --windowed --name PixelTrigger --icon icon.ico --add-data "donation.png;." --add-data "icon.ico;." --hidden-import platform_backend --hidden-import PIL.ImageGrab color_watcher.py
+
+      - name: Verify output
+        run: |
+          dir dist
+          if (!(Test-Path dist/PixelTrigger.exe)) { throw "PixelTrigger.exe not found" }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PixelTrigger-windows
+          path: dist/PixelTrigger.exe
+          if-no-files-found: error
+
+      - name: Attach to Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/PixelTrigger.exe

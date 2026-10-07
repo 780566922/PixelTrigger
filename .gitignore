@@ -5,6 +5,10 @@ dist/
 
 # 打包用构建环境
 .build/
+.build_win/
+
+# PyInstaller 自动生成的 spec 文件
+*.spec
 
 # Python 缓存
 __pycache__/

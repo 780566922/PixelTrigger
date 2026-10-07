@@ -68,7 +68,7 @@ OPTIONS = {
         'NSScreenCaptureUsageDescription': '需要屏幕录制权限以识别指定区域的像素颜色',
     },
     'packages': PYOBJC_MODULES + ['PIL', 'tkinter'],
-    'includes': PYOBJC_MODULES + PIL_MODULES + TK_MODULES,
+    'includes': PYOBJC_MODULES + PIL_MODULES + TK_MODULES + ['platform_backend'],
     'excludes': [
         #体积大且完全用不到的科学计算栈
         'numpy', 'scipy', 'pandas', 'matplotlib',

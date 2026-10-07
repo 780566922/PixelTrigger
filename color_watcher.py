@@ -1,7 +1,6 @@
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
 from PIL import Image, ImageTk
-import Quartz
 import subprocess
 import time
 import os
@@ -11,17 +10,15 @@ import math
 import threading
 import queue
 
-try:
-    from ApplicationServices import AXIsProcessTrusted, AXIsProcessTrustedWithOptions
-    HAS_AX = True
-except ImportError:
-    AXIsProcessTrusted = None
-    AXIsProcessTrustedWithOptions = None
-    HAS_AX = False
+# 平台适配层：截图 / 键鼠模拟 / 系统外观 / 权限 / 配置路径等系统级差异
+# 全部收口在 platform_backend，本文件保持平台无关。
+import platform_backend as pb
 
 # ============================================================
 APP_NAME = "PixelTrigger"
-APP_SUPPORT_DIR = os.path.expanduser(f"~/Library/Application Support/{APP_NAME}")
+# 配置目录由平台层决定：macOS 用 ~/Library/Application Support，
+# Windows 用 %APPDATA%。
+APP_SUPPORT_DIR = pb.app_support_dir()
 
 # 测试/自动化脚本通过设置 PIXELTRIGGER_CONFIG 指向临时路径，
 # 避免污染用户真实配置（历史上已两次因测试 save_config 覆盖真实数据）。
@@ -35,11 +32,16 @@ os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
 def get_donation_path():
     """
     获取捐赠二维码图片路径，优先级：
-    1. py2app 打包后 .app 内部 Resources/donation.png
-    2. 脚本同级目录 donation.png
-    3. 用户配置目录 ~/Library/Application Support/PixelTrigger/donation.png（兼容旧版）
+    1. PyInstaller 打包后（Windows）：sys._MEIPASS/donation.png
+    2. py2app 打包后（macOS .app 内 Resources/donation.png）
+    3. 脚本同级目录 donation.png
+    4. 用户配置目录下的 donation.png（兼容旧版）
     """
     candidates = []
+    # PyInstaller 单文件模式：资源被解包到 sys._MEIPASS
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(os.path.join(meipass, "donation.png"))
     if getattr(sys, 'frozen', False):
         # py2app：可执行文件在 Contents/MacOS/，资源在 Contents/Resources/
         exe_dir = os.path.dirname(sys.executable)
@@ -59,6 +61,26 @@ def get_donation_path():
         except Exception:
             pass
     candidates.append(os.path.join(APP_SUPPORT_DIR, "donation.png"))
+    for p in candidates:
+        if p and os.path.exists(p):
+            return p
+    return None
+
+
+def get_app_icon_path():
+    """Windows 下窗口 / 任务栏图标 icon.ico 的路径；macOS 返回 None
+    （macOS 的图标由 .app 包内的 icns 提供，无需在此设置）。"""
+    if not pb.IS_WIN:
+        return None
+    candidates = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(os.path.join(meipass, "icon.ico"))
+    try:
+        candidates.append(os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "icon.ico"))
+    except Exception:
+        pass
     for p in candidates:
         if p and os.path.exists(p):
             return p
@@ -96,15 +118,6 @@ THEME_POLL_MS = 1000
 # 日志区保留的最大行数，超出后丢弃最旧的。
 LOG_MAX_LINES = 2000
 
-# 显示器列表最大数量（CGGetActiveDisplayList 缓冲区上限）
-MAX_DISPLAYS = 16
-
-# Tk 事件 state 中的修饰键位掩码（与 Quartz 的 kCGEventFlagMask* 对应）
-FLAG_MASK_CMD = 0x0010
-FLAG_MASK_OPT = 0x0008
-FLAG_MASK_CTRL = 0x0004
-FLAG_MASK_SHIFT = 0x0001
-
 HUE_PRESETS = [
     ("赤", "#FF3B30", (255, 59, 48)),
     ("橙", "#FF9500", (255, 149, 0)),
@@ -116,23 +129,6 @@ HUE_PRESETS = [
 ]
 HUE_DEFAULT_TOL = 70
 
-KEYSYM_TO_MAC = {
-    'a': 0, 'b': 11, 'c': 8, 'd': 2, 'e': 14, 'f': 3, 'g': 5, 'h': 4,
-    'i': 34, 'j': 38, 'k': 40, 'l': 37, 'm': 46, 'n': 45, 'o': 31, 'p': 35,
-    'q': 12, 'r': 15, 's': 1, 't': 17, 'u': 32, 'v': 9, 'w': 13, 'x': 7,
-    'y': 16, 'z': 6,
-    '0': 29, '1': 18, '2': 19, '3': 20, '4': 21, '5': 23, '6': 22, '7': 26,
-    '8': 28, '9': 25,
-    'Return': 36, 'KP_Enter': 76, 'Tab': 48, 'space': 49, 'BackSpace': 51,
-    'Escape': 53, 'Delete': 117,
-    'Left': 123, 'Right': 124, 'Down': 125, 'Up': 126,
-    'Home': 115, 'End': 119, 'Prior': 116, 'Next': 121,
-    'F1': 122, 'F2': 120, 'F3': 99, 'F4': 118, 'F5': 96, 'F6': 97,
-    'F7': 98, 'F8': 100, 'F9': 101, 'F10': 109, 'F11': 103, 'F12': 111,
-    'minus': 27, 'equal': 24, 'bracketleft': 33, 'bracketright': 30,
-    'backslash': 41, 'semicolon': 39, 'apostrophe': 43, 'grave': 50,
-    'comma': 44, 'period': 47, 'slash': 42,
-}
 MODIFIER_KEYSYMS = {"Shift_L", "Shift_R", "Control_L", "Control_R",
                     "Alt_L", "Alt_R", "Meta_L", "Meta_R",
                     "Super_L", "Super_R", "Command", "Caps_Lock"}
@@ -140,7 +136,8 @@ DISPLAY_NAME = {"Return": "Return", "KP_Enter": "Enter", "space": "Space",
                 "Tab": "Tab", "BackSpace": "Backspace", "Escape": "Esc",
                 "Delete": "Delete", "Prior": "PageUp", "Next": "PageDown",
                 "Left": "←", "Right": "→", "Up": "↑", "Down": "↓"}
-MOD_SYMBOL = {"cmd": "⌘", "shift": "⇧", "ctrl": "⌃", "opt": "⌥"}
+# 修饰键符号由平台层提供（macOS: ⌘⇧⌃⌥，Windows: Win/Shift/Ctrl/Alt）
+MOD_SYMBOL = pb.MOD_SYMBOL
 
 C_WINDOW_BG = "#ECECEC"
 C_CARD_BG = "#FFFFFF"
@@ -279,63 +276,26 @@ CURRENT_THEME = THEME_LIGHT
 
 def detect_system_theme():
     """
-    读取系统外观设置，返回 THEME_LIGHT / THEME_DARK。
+    读取系统外观，返回 THEME_LIGHT / THEME_DARK。
 
-    优先走 CFPreferences：进程内读取，无需 fork `defaults`，适合高频轮询。
-    读取前必须先AppSynchronize，否则拿到的可能是进程启动时缓存的值。
-    个别环境（如未链接 CoreFoundation 的精简解释器）不可用时退回
-    `defaults read`，两条路径失败都按浅色处理。
+    读取方式委托平台层（platform_backend.get_system_theme）：
+      - macOS：CFPreferences 进程内读取，失败退回 `defaults read`
+      - Windows：注册表 AppsUseLightTheme
+    读不到一律按浅色处理。
     """
-    # 浅色模式下 AppleInterfaceStyle 这个 key 根本不存在，
-    # CFPreferencesCopyAppValue 返回 None 即代表浅色。
-    try:
-        Quartz.CFPreferencesAppSynchronize("kCFPreferencesCurrentUser")
-        val = Quartz.CFPreferencesCopyAppValue(
-            "AppleInterfaceStyle", "kCFPreferencesCurrentUser")
-        return THEME_DARK if str(val).strip().lower() == "dark" else THEME_LIGHT
-    except Exception:
-        pass
-    try:
-        res = subprocess.run(
-            ["defaults", "read", "-g", "AppleInterfaceStyle"],
-            capture_output=True, text=True, timeout=2)
-        if res.returncode == 0 and res.stdout.strip().lower() == "dark":
-            return THEME_DARK
-    except Exception:
-        pass
-    return THEME_LIGHT
+    return THEME_DARK if pb.get_system_theme() == "dark" else THEME_LIGHT
 
 
 def detect_running_from_dmg():
     """
-    检测当前是否从 DMG 挂载卷（/Volumes/...）运行。
+    检测当前是否从只读卷（macOS 的 DMG 挂载点 /Volumes/...）直接运行。
 
-    macOS 的 TCC 权限（辅助功能 / 屏幕录制）按「完整路径 + 代码签名」
-    匹配授权记录。从只读 DMG 卷运行 app 有两大问题：
-      1. 挂载路径不稳定——重复挂载会变成 /Volumes/PixelTrigger 1、
-         /Volumes/PixelTrigger 2 ...，路径一变授权立即失效；
-      2. 部分系统对从只读卷运行的程序拒绝写入 TCC 记录。
-    因此必须引导用户把 app 拖到「应用程序」目录再运行。
-
-    定位 app 真实位置时优先用 CFBundleGetMainBundle()（打包成 .app 后
-    权威）；源码运行（无 bundle）时退回 sys.executable。
+    macOS 的 TCC 授权按「完整路径 + 代码签名」匹配，从 DMG 直接运行会因
+    挂载路径不稳定（/Volumes/PixelTrigger 1、2 …）而无法获得稳定授权，
+    需引导用户拖到「应用程序」目录再运行。Windows 无此机制，恒为 False。
+    实现委托平台层。
     """
-    # 1) 打包成 .app 后：从 main bundle 拿真实路径
-    try:
-        bundle = Quartz.CFBundleGetMainBundle()
-        if bundle:
-            url = Quartz.CFBundleCopyBundleURL(bundle)
-            path = Quartz.CFURLCopyFileSystemPath(url, 0)
-            if path:
-                return str(path).startswith("/Volumes/")
-    except Exception:
-        pass
-    # 2) 源码运行（无 bundle）：退回解释器路径
-    try:
-        exe = os.path.realpath(sys.executable)
-    except Exception:
-        exe = sys.executable
-    return exe.startswith("/Volumes/")
+    return pb.is_readonly_volume_run()
 
 
 def apply_theme(theme):
@@ -399,8 +359,8 @@ class FancyButton:
         self.enabled = True
         self.label = tk.Label(
             parent, text=text, bg=bg_normal, fg=fg_normal,
-            font=("Helvetica Neue", font_size, "bold"),
-            padx=padx, pady=pady, cursor="pointinghand")
+            font=(pb.FONT_UI, font_size, "bold"),
+            padx=padx, pady=pady, cursor=pb.HAND_CURSOR)
         self.label.bind("<Enter>", self._enter)
         self.label.bind("<Leave>", self._leave)
         self.label.bind("<Button-1>", self._click)
@@ -421,7 +381,7 @@ class FancyButton:
         self.enabled = enabled
         if enabled:
             self.label.configure(bg=self.bg_normal, fg=self.fg_normal,
-                                  cursor="pointinghand")
+                                  cursor=pb.HAND_CURSOR)
         else:
             self.label.configure(bg=self.bg_disabled, fg=self.fg_disabled,
                                   cursor="arrow")
@@ -434,25 +394,11 @@ class FancyButton:
 
 
 def capture_region(x, y, w, h):
-    rect = Quartz.CGRectMake(x, y, w, h)
-    cg = Quartz.CGWindowListCreateImage(
-        rect, Quartz.kCGWindowListOptionOnScreenOnly,
-        Quartz.kCGNullWindowID, Quartz.kCGWindowImageDefault)
-    if cg is None:
-        return None
-    width = Quartz.CGImageGetWidth(cg)
-    height = Quartz.CGImageGetHeight(cg)
-    bpr = Quartz.CGImageGetBytesPerRow(cg)
-    # 关键：先把 CGImage 的像素数据完整拷贝到 Python bytes，之后
-    # CGImage/CFData 由 pyobjc 的引用计数自动释放即可。
-    # 注意不能手动 CGImageRelease(cg)：pyobjc 托管对象在 Python 侧
-    # __del__ 里还会再 release 一次，手动 release 会导致双重释放，
-    # 在打包环境（冻结 pyobjc + macOS 15）下直接 SIGSEGV 闪退。
-    data = Quartz.CGDataProviderCopyData(Quartz.CGImageGetDataProvider(cg))
-    buf = bytes(data)
-    del data
-    return Image.frombuffer("RGBA", (width, height), buf,
-                            "raw", "BGRA", bpr, 1).convert("RGB")
+    """截取屏幕矩形区域，返回 PIL.Image(RGB)；失败返回 None。
+
+    macOS 走 Quartz，Windows 走 PIL.ImageGrab，差异已由平台层封装。
+    """
+    return pb.grab_region(x, y, w, h)
 
 
 def pick_color_at(gx, gy):
@@ -475,17 +421,13 @@ def smooth_scroll(total_pixels, duration, direction, stop_event):
         target = int(total_pixels * ease(t) + 0.5)
         step = target - scrolled
         if step > 0:
-            evt = Quartz.CGEventCreateScrollWheelEvent(
-                None, Quartz.kCGScrollEventUnitPixel, 1, sign * step)
-            Quartz.CGEventPost(Quartz.kCGHIDEventTap, evt)
+            pb.post_scroll(sign * step)
             scrolled = target
         time.sleep(interval)
     if not stop_event.is_set():
         tail = total_pixels - scrolled
         if tail > 0:
-            evt = Quartz.CGEventCreateScrollWheelEvent(
-                None, Quartz.kCGScrollEventUnitPixel, 1, sign * tail)
-            Quartz.CGEventPost(Quartz.kCGHIDEventTap, evt)
+            pb.post_scroll(sign * tail)
 
 
 def _combo_to_parts(combo):
@@ -497,56 +439,56 @@ def _combo_to_parts(combo):
     return parts[:-1], parts[-1]
 
 
-def _mods_to_flags(mods):
-    f = 0
-    for m in mods:
-        if m == "cmd": f |= Quartz.kCGEventFlagMaskCommand
-        elif m == "shift": f |= Quartz.kCGEventFlagMaskShift
-        elif m == "ctrl": f |= Quartz.kCGEventFlagMaskControl
-        elif m == "opt": f |= Quartz.kCGEventFlagMaskAlternate
-    return f
-
-
 def send_key_combo(combo, action, count, interval, hold_duration, stop_event):
+    """发送按键组合。
+
+    修饰键改为显式的「按下 → 主键 → 抬起」事件序列，使 macOS 与
+    Windows 行为一致（底层实现由平台层 platform_backend.key_event 提供）。
+    """
     mods, main = _combo_to_parts(combo)
     if main is None:
         return
-    kc = KEYSYM_TO_MAC.get(main)
-    if kc is None:
+    if not pb.is_supported_key(main):
         return
-    flags = _mods_to_flags(mods)
+
+    def _down_mods():
+        for m in mods:
+            pb.key_event(m, True)
+
+    def _up_mods():
+        for m in reversed(mods):
+            pb.key_event(m, False)
 
     def press_once():
-        d = Quartz.CGEventCreateKeyboardEvent(None, kc, True)
-        Quartz.CGEventSetFlags(d, flags)
-        Quartz.CGEventPost(Quartz.kCGHIDEventTap, d)
-        u = Quartz.CGEventCreateKeyboardEvent(None, kc, False)
-        Quartz.CGEventSetFlags(u, flags)
-        Quartz.CGEventPost(Quartz.kCGHIDEventTap, u)
+        _down_mods()
+        pb.key_event(main, True)
+        pb.key_event(main, False)
+        _up_mods()
 
     def hold_once(dur):
-        d = Quartz.CGEventCreateKeyboardEvent(None, kc, True)
-        Quartz.CGEventSetFlags(d, flags)
-        Quartz.CGEventPost(Quartz.kCGHIDEventTap, d)
+        _down_mods()
+        pb.key_event(main, True)
         end = time.time() + dur
         while time.time() < end:
-            if stop_event.is_set(): break
+            if stop_event.is_set():
+                break
             time.sleep(0.02)
-        u = Quartz.CGEventCreateKeyboardEvent(None, kc, False)
-        Quartz.CGEventSetFlags(u, flags)
-        Quartz.CGEventPost(Quartz.kCGHIDEventTap, u)
+        pb.key_event(main, False)
+        _up_mods()
 
     try:
         if action == "press":
             press_once()
         elif action == "repeat":
             for i in range(max(1, count)):
-                if stop_event.is_set(): return
+                if stop_event.is_set():
+                    return
                 press_once()
                 if i < count - 1:
                     end = time.time() + interval
                     while time.time() < end:
-                        if stop_event.is_set(): return
+                        if stop_event.is_set():
+                            return
                         time.sleep(0.02)
         elif action == "hold":
             hold_once(max(0.05, hold_duration))
@@ -661,7 +603,7 @@ class ToolTip:
         except Exception:
             pass
         tk.Label(tw, text=self.text, bg=C_PREVIEW_BG, fg=C_TITLE,
-                 font=("Helvetica Neue", 11), justify="left", anchor="w",
+                 font=(pb.FONT_UI, 11), justify="left", anchor="w",
                  padx=14, pady=10, wraplength=280,
                  highlightbackground=C_HUE_BORDER,
                  highlightthickness=1).pack()
@@ -927,7 +869,7 @@ class PixelTriggerApp:
         hdr = tk.Frame(card, bg=C_CARD_BG)
         hdr.pack(fill="x", padx=12, pady=(8, 0))
         tk.Label(hdr, text=title, bg=C_CARD_BG, fg=C_CARD_TITLE,
-                 font=("Helvetica Neue", 10, "bold"),
+                 font=(pb.FONT_UI, 10, "bold"),
                  anchor="w").pack(fill="x")
         body = tk.Frame(card, bg=C_CARD_BG)
         body.pack(fill="both", expand=True, padx=12, pady=(6, 10))
@@ -936,10 +878,10 @@ class PixelTriggerApp:
     def _make_field(self, parent, label, key, default="", width=6):
         f = tk.Frame(parent, bg=C_CARD_BG)
         tk.Label(f, text=label, bg=C_CARD_BG, fg=C_LABEL,
-                 font=("Helvetica Neue", 10), anchor="w").pack(fill="x")
+                 font=(pb.FONT_UI, 10), anchor="w").pack(fill="x")
         v = tk.StringVar(value=self.cfg_values.get(key, default))
         self.vars[key] = v
-        e = ttk.Entry(f, textvariable=v, width=width, font=("Menlo", 11))
+        e = ttk.Entry(f, textvariable=v, width=width, font=(pb.FONT_MONO, 11))
         e.pack(fill="x", pady=(2, 0), ipady=1)
         return f, e
 
@@ -963,10 +905,10 @@ class PixelTriggerApp:
         left = tk.Frame(top, bg=C_WINDOW_BG)
         left.pack(side="left")
         tk.Label(left, text="🎯  PixelTrigger", bg=C_WINDOW_BG, fg=C_TITLE,
-                 font=("Helvetica Neue", 18, "bold")).pack(side="left")
+                 font=(pb.FONT_UI, 18, "bold")).pack(side="left")
         tk.Label(left, text="  像素触发器",
                  bg=C_WINDOW_BG, fg=C_SUBTEXT,
-                 font=("Helvetica Neue", 11)).pack(side="left", pady=(6, 0))
+                 font=(pb.FONT_UI, 11)).pack(side="left", pady=(6, 0))
 
         right = tk.Frame(top, bg=C_WINDOW_BG)
         right.pack(side="right")
@@ -974,25 +916,30 @@ class PixelTriggerApp:
         perm_area = tk.Frame(right, bg=C_WINDOW_BG)
         perm_area.pack(side="right")
 
-        def mk_perm(text):
-            f = tk.Frame(perm_area, bg=C_WINDOW_BG, cursor="hand2")
-            dot = tk.Label(f, text="●", bg=C_WINDOW_BG,
-                           font=("Helvetica Neue", 11), fg=C_GRAY_DISABLED_FG)
-            dot.pack(side="left", padx=(0, 4))
-            lbl = tk.Label(f, text=text, bg=C_WINDOW_BG, fg=C_LABEL,
-                           font=("Helvetica Neue", 11))
-            lbl.pack(side="left")
-            return f, dot, lbl
+        # 权限指示仅在存在「需要用户授权」机制的平台上显示（macOS）。
+        # Windows 截图与模拟输入无需授权，隐藏该区域避免误导。
+        self.screen_perm_frame = self.screen_perm_dot = self.screen_perm_lbl = None
+        self.ax_perm_frame = self.ax_perm_dot = self.ax_perm_lbl = None
+        if pb.permission_system_available():
+            def mk_perm(text):
+                f = tk.Frame(perm_area, bg=C_WINDOW_BG, cursor=pb.HAND_CURSOR)
+                dot = tk.Label(f, text="●", bg=C_WINDOW_BG,
+                               font=(pb.FONT_UI, 11), fg=C_GRAY_DISABLED_FG)
+                dot.pack(side="left", padx=(0, 4))
+                lbl = tk.Label(f, text=text, bg=C_WINDOW_BG, fg=C_LABEL,
+                               font=(pb.FONT_UI, 11))
+                lbl.pack(side="left")
+                return f, dot, lbl
 
-        self.screen_perm_frame, self.screen_perm_dot, self.screen_perm_lbl = mk_perm("屏幕录制")
-        self.ax_perm_frame, self.ax_perm_dot, self.ax_perm_lbl = mk_perm("辅助功能")
-        self.ax_perm_frame.pack(side="left", padx=(16, 0))
-        self.screen_perm_frame.pack(side="left")
+            self.screen_perm_frame, self.screen_perm_dot, self.screen_perm_lbl = mk_perm("屏幕录制")
+            self.ax_perm_frame, self.ax_perm_dot, self.ax_perm_lbl = mk_perm("辅助功能")
+            self.ax_perm_frame.pack(side="left", padx=(16, 0))
+            self.screen_perm_frame.pack(side="left")
 
-        for w in (self.screen_perm_frame, self.screen_perm_dot, self.screen_perm_lbl):
-            w.bind("<Button-1>", lambda e: self.open_screen_settings())
-        for w in (self.ax_perm_frame, self.ax_perm_dot, self.ax_perm_lbl):
-            w.bind("<Button-1>", lambda e: self.open_ax_settings())
+            for w in (self.screen_perm_frame, self.screen_perm_dot, self.screen_perm_lbl):
+                w.bind("<Button-1>", lambda e: self.open_screen_settings())
+            for w in (self.ax_perm_frame, self.ax_perm_dot, self.ax_perm_lbl):
+                w.bind("<Button-1>", lambda e: self.open_ax_settings())
 
         tk.Frame(right, bg=C_HUE_BORDER, width=1, height=24).pack(
             side="right", padx=(16, 0), pady=6)
@@ -1021,7 +968,7 @@ class PixelTriggerApp:
 
         donate_btn = tk.Label(
             right, text="❤", bg=C_WINDOW_BG, fg=C_RED,
-            font=("Helvetica Neue", 18), cursor="pointinghand",
+            font=(pb.FONT_UI, 18), cursor=pb.HAND_CURSOR,
             padx=6, pady=2)
         donate_btn.pack(side="right", padx=(0, 16))
         donate_btn.bind("<Button-1>", lambda e: self.open_donation())
@@ -1058,10 +1005,10 @@ class PixelTriggerApp:
 
         tk.Label(dlg, text="❤️  感谢您的支持",
                  bg=C_WINDOW_BG, fg=C_TITLE,
-                 font=("Helvetica Neue", 16, "bold")).pack(pady=(22, 4))
+                 font=(pb.FONT_UI, 16, "bold")).pack(pady=(22, 4))
         tk.Label(dlg, text="如果您觉得 PixelTrigger 有帮助，欢迎扫码打赏",
                  bg=C_WINDOW_BG, fg=C_SUBTEXT,
-                 font=("Helvetica Neue", 11)).pack(pady=(0, 14))
+                 font=(pb.FONT_UI, 11)).pack(pady=(0, 14))
 
         img_frame = tk.Frame(dlg, bg=C_CARD_BG,
                              highlightbackground=C_CARD_BORDER,
@@ -1085,7 +1032,7 @@ class PixelTriggerApp:
         if not shown:
             tk.Label(img_frame, text="（未找到捐赠二维码）",
                      bg=C_CARD_BG, fg=C_SUBTEXT,
-                     font=("Helvetica Neue", 11),
+                     font=(pb.FONT_UI, 11),
                      width=32, height=10,
                      justify="center").pack(padx=10, pady=10)
 
@@ -1093,8 +1040,8 @@ class PixelTriggerApp:
         btns.pack(pady=(0, 18))
 
         close_btn = tk.Label(btns, text="关闭", bg=C_ACCENT, fg=C_ON_ACCENT_BTN,
-                             font=("Helvetica Neue", 11, "bold"),
-                             padx=20, pady=6, cursor="pointinghand")
+                             font=(pb.FONT_UI, 11, "bold"),
+                             padx=20, pady=6, cursor=pb.HAND_CURSOR)
         close_btn.bind("<Enter>", lambda e: close_btn.configure(
             bg=C_ACCENT_H, fg=C_ON_ACCENT_BTN_H))
         close_btn.bind("<Leave>", lambda e: close_btn.configure(
@@ -1136,18 +1083,18 @@ class PixelTriggerApp:
         st = tk.Frame(b, bg=C_CARD_BG)
         st.pack(fill="x")
         self.status_dot = tk.Label(st, text="●", bg=C_CARD_BG,
-                                     font=("Helvetica Neue", 20),
+                                     font=(pb.FONT_UI, 20),
                                      fg=C_GRAY_DISABLED_FG)
         self.status_dot.pack(side="left", padx=(0, 8))
         self.status_var = tk.StringVar(value="未运行")
         self.status_label = tk.Label(st, textvariable=self.status_var,
                                        bg=C_CARD_BG, fg=C_SUBTEXT,
-                                       font=("Helvetica Neue", 22, "bold"),
+                                       font=(pb.FONT_UI, 22, "bold"),
                                        anchor="w")
         self.status_label.pack(side="left")
         self.match_var = tk.StringVar(value="匹配像素：—")
         tk.Label(b, textvariable=self.match_var, bg=C_CARD_BG,
-                 fg=C_SUBTEXT, font=("Menlo", 10),
+                 fg=C_SUBTEXT, font=(pb.FONT_MONO, 10),
                  anchor="w").pack(fill="x", pady=(6, 0))
 
         outer, b = self._make_card(parent, "监控区域")
@@ -1180,13 +1127,13 @@ class PixelTriggerApp:
                         variable=self.color_mode, value="hue",
                         bg=C_CARD_BG, fg=C_TITLE,
                         activebackground=C_CARD_BG,
-                        font=("Helvetica Neue", 11),
+                        font=(pb.FONT_UI, 11),
                         command=self._on_mode_change).pack(side="left", padx=(0, 16))
         tk.Radiobutton(mr, text="精准容差",
                         variable=self.color_mode, value="precise",
                         bg=C_CARD_BG, fg=C_TITLE,
                         activebackground=C_CARD_BG,
-                        font=("Helvetica Neue", 11),
+                        font=(pb.FONT_UI, 11),
                         command=self._on_mode_change).pack(side="left")
 
         self.hue_panel = tk.Frame(b, bg=C_CARD_BG)
@@ -1220,11 +1167,11 @@ class PixelTriggerApp:
                   f"B{self.cfg_values.get('precise_b','202')}")
         tk.Label(pr1, textvariable=self.base_rgb_var,
                  bg=C_CARD_BG, fg=C_TITLE,
-                 font=("Menlo", 10)).pack(side="left")
+                 font=(pb.FONT_MONO, 10)).pack(side="left")
         pr2 = tk.Frame(self.precise_panel, bg=C_CARD_BG)
         pr2.pack(fill="x")
         tk.Label(pr2, text="容差", bg=C_CARD_BG, fg=C_LABEL,
-                 font=("Helvetica Neue", 10)).pack(side="left", padx=(0, 6))
+                 font=(pb.FONT_UI, 10)).pack(side="left", padx=(0, 6))
         tol_init = int(float(self.cfg_values.get("precise_tol", "30")))
         self.tol_var = tk.IntVar(value=tol_init)
         self.vars["precise_tol"] = self.tol_var
@@ -1232,11 +1179,11 @@ class PixelTriggerApp:
                    variable=self.tol_var, length=200).pack(side="left", padx=(0, 8))
         self.tol_label = tk.Label(pr2, text=str(tol_init),
                                     bg=C_CARD_BG, fg=C_TITLE,
-                                    font=("Menlo", 11, "bold"),
+                                    font=(pb.FONT_MONO, 11, "bold"),
                                     width=4, anchor="e")
         self.tol_label.pack(side="left")
         tk.Label(pr2, text="(0-120)", bg=C_CARD_BG, fg=C_SUBTEXT,
-                 font=("Helvetica Neue", 9)).pack(side="left", padx=(4, 0))
+                 font=(pb.FONT_UI, 9)).pack(side="left", padx=(4, 0))
 
         def _on_tol(*a):
             try:
@@ -1256,10 +1203,10 @@ class PixelTriggerApp:
         v_cd = tk.StringVar(value=self.cfg_values.get("cd", "5"))
         self.vars["cd"] = v_cd
         ttk.Spinbox(cdr, textvariable=v_cd, from_=0, to=1000,
-                     increment=0.5, width=5, font=("Menlo", 11),
+                     increment=0.5, width=5, font=(pb.FONT_MONO, 11),
                      justify="center").pack(side="left", ipady=1)
         tk.Label(cdr, text="秒", bg=C_CARD_BG, fg=C_LABEL,
-                 font=("Helvetica Neue", 11)).pack(side="left", padx=(4, 12))
+                 font=(pb.FONT_UI, 11)).pack(side="left", padx=(4, 12))
         for secs in (2, 4, 6, 8, 10):
             ttk.Button(cdr, text=f"{secs}s", width=3,
                         command=lambda s=secs: v_cd.set(str(s))
@@ -1284,29 +1231,29 @@ class PixelTriggerApp:
         tk.Radiobutton(tm, text="滚动翻页", variable=self.trigger_mode,
                         value="scroll", bg=C_CARD_BG, fg=C_TITLE,
                         activebackground=C_CARD_BG,
-                        font=("Helvetica Neue", 11),
+                        font=(pb.FONT_UI, 11),
                         command=self._on_trigger_mode_change).pack(side="left", padx=(0, 14))
         tk.Radiobutton(tm, text="触发按键", variable=self.trigger_mode,
                         value="key", bg=C_CARD_BG, fg=C_TITLE,
                         activebackground=C_CARD_BG,
-                        font=("Helvetica Neue", 11),
+                        font=(pb.FONT_UI, 11),
                         command=self._on_trigger_mode_change).pack(side="left")
 
         self.scroll_panel = tk.Frame(b, bg=C_CARD_BG)
         sr = tk.Frame(self.scroll_panel, bg=C_CARD_BG)
         sr.pack(fill="x", pady=(8, 4))
         tk.Label(sr, text="方向", bg=C_CARD_BG, fg=C_LABEL,
-                 font=("Helvetica Neue", 10)).pack(side="left", padx=(0, 6))
+                 font=(pb.FONT_UI, 10)).pack(side="left", padx=(0, 6))
         self.scroll_dir = tk.StringVar(
             value=self.cfg_values.get("scroll_dir", "up"))
         tk.Radiobutton(sr, text="向上", variable=self.scroll_dir, value="up",
                         bg=C_CARD_BG, fg=C_TITLE,
                         activebackground=C_CARD_BG,
-                        font=("Helvetica Neue", 10)).pack(side="left", padx=(0, 10))
+                        font=(pb.FONT_UI, 10)).pack(side="left", padx=(0, 10))
         tk.Radiobutton(sr, text="向下", variable=self.scroll_dir, value="down",
                         bg=C_CARD_BG, fg=C_TITLE,
                         activebackground=C_CARD_BG,
-                        font=("Helvetica Neue", 10)).pack(side="left")
+                        font=(pb.FONT_UI, 10)).pack(side="left")
         sr2 = tk.Frame(self.scroll_panel, bg=C_CARD_BG)
         sr2.pack(fill="x")
         f1, e1 = self._make_field(sr2, "总距离", "total_pixels", width=5)
@@ -1320,12 +1267,12 @@ class PixelTriggerApp:
         kr1 = tk.Frame(self.key_panel, bg=C_CARD_BG)
         kr1.pack(fill="x", pady=(8, 4))
         tk.Label(kr1, text="按键", bg=C_CARD_BG, fg=C_LABEL,
-                 font=("Helvetica Neue", 10)).pack(side="left", padx=(0, 6))
+                 font=(pb.FONT_UI, 10)).pack(side="left", padx=(0, 6))
         self.key_display_var = tk.StringVar(
             value=format_key_display(self.key_combo_str))
         tk.Label(kr1, textvariable=self.key_display_var,
                  bg=C_PREVIEW_BG, fg=C_TITLE,
-                 font=("Menlo", 11, "bold"),
+                 font=(pb.FONT_MONO, 11, "bold"),
                  padx=10, pady=4,
                  highlightbackground=C_HUE_BORDER,
                  highlightthickness=1).pack(side="left", padx=(0, 6))
@@ -1335,14 +1282,14 @@ class PixelTriggerApp:
         kr2 = tk.Frame(self.key_panel, bg=C_CARD_BG)
         kr2.pack(fill="x", pady=(0, 4))
         tk.Label(kr2, text="动作", bg=C_CARD_BG, fg=C_LABEL,
-                 font=("Helvetica Neue", 10)).pack(side="left", padx=(0, 6))
+                 font=(pb.FONT_UI, 10)).pack(side="left", padx=(0, 6))
         self.key_action = tk.StringVar(
             value=self.cfg_values.get("key_action", "press"))
         for txt, val in [("按一下", "press"), ("连按", "repeat"), ("按住", "hold")]:
             tk.Radiobutton(kr2, text=txt, variable=self.key_action, value=val,
                             bg=C_CARD_BG, fg=C_TITLE,
                             activebackground=C_CARD_BG,
-                            font=("Helvetica Neue", 10),
+                            font=(pb.FONT_UI, 10),
                             command=self._on_key_action_change
                             ).pack(side="left", padx=(0, 10))
 
@@ -1374,7 +1321,7 @@ class PixelTriggerApp:
 
         self.preview_label = tk.Label(preview_box, text="（未运行）",
                                        bg=C_PREVIEW_BG, fg=C_SUBTEXT,
-                                       font=("Helvetica Neue", 11))
+                                       font=(pb.FONT_UI, 11))
         self.preview_label.pack(fill="both", expand=True)
 
     def _build_params_bar(self):
@@ -1405,7 +1352,7 @@ class PixelTriggerApp:
         hdr = tk.Frame(card, bg=C_CARD_BG)
         hdr.pack(fill="x", padx=12, pady=(6, 0))
         tk.Label(hdr, text="日志", bg=C_CARD_BG, fg=C_CARD_TITLE,
-                 font=("Helvetica Neue", 10, "bold"),
+                 font=(pb.FONT_UI, 10, "bold"),
                  anchor="w").pack(side="left")
 
         log_inner = tk.Frame(card, bg=C_CARD_BG)
@@ -1414,7 +1361,7 @@ class PixelTriggerApp:
         self.log = scrolledtext.ScrolledText(
             log_inner, state="disabled", wrap="word",
             width=1, height=8,
-            font=("Menlo", 10),
+            font=(pb.FONT_MONO, 10),
             relief="flat", bd=0,
             highlightthickness=1,
             highlightbackground=C_CARD_BORDER,
@@ -1547,22 +1494,22 @@ class PixelTriggerApp:
 
         tk.Label(dlg, text="请按下一个键作为触发按键",
                  bg=C_WINDOW_BG, fg=C_TITLE,
-                 font=("Helvetica Neue", 14, "bold")).pack(pady=(24, 4))
+                 font=(pb.FONT_UI, 14, "bold")).pack(pady=(24, 4))
         tk.Label(dlg, text="支持字母、数字、方向键、F1-F12、以及 ⌘/⇧/⌃/⌥ 组合键",
                  bg=C_WINDOW_BG, fg=C_SUBTEXT,
-                 font=("Helvetica Neue", 10)).pack(pady=(0, 12))
+                 font=(pb.FONT_UI, 10)).pack(pady=(0, 12))
 
         status_var = tk.StringVar(value="⌨️  等待按键…")
         status_label = tk.Label(dlg, textvariable=status_var,
                                  bg=C_PREVIEW_BG, fg=C_ACCENT,
-                                 font=("Menlo", 16, "bold"),
+                                 font=(pb.FONT_MONO, 16, "bold"),
                                  padx=18, pady=12,
                                  highlightbackground=C_HUE_BORDER,
                                  highlightthickness=1)
         status_label.pack(pady=(0, 6))
 
         tk.Label(dlg, text="按 ESC 取消", bg=C_WINDOW_BG, fg=C_SUBTEXT,
-                 font=("Helvetica Neue", 10)).pack(pady=(0, 12))
+                 font=(pb.FONT_UI, 10)).pack(pady=(0, 12))
 
         state = {"done": False}
 
@@ -1590,13 +1537,10 @@ class PixelTriggerApp:
                 return
             keysym = event.keysym
             flags = event.state
+            # 修饰键位掩码随平台不同，统一交给平台层解析
+            mods = pb.decode_mods(flags)
 
             if keysym in MODIFIER_KEYSYMS:
-                mods = []
-                if flags & FLAG_MASK_CMD: mods.append("cmd")
-                if flags & FLAG_MASK_OPT: mods.append("opt")
-                if flags & FLAG_MASK_CTRL: mods.append("ctrl")
-                if flags & FLAG_MASK_SHIFT: mods.append("shift")
                 if mods:
                     s = "".join(MOD_SYMBOL.get(m, m) for m in mods)
                     status_var.set(f"{s}  …  再按一个键")
@@ -1604,11 +1548,6 @@ class PixelTriggerApp:
                 return
 
             main = keysym.lower() if len(keysym) == 1 and keysym.isalpha() else keysym
-            mods = []
-            if flags & FLAG_MASK_CMD: mods.append("cmd")
-            if flags & FLAG_MASK_OPT: mods.append("opt")
-            if flags & FLAG_MASK_CTRL: mods.append("ctrl")
-            if flags & FLAG_MASK_SHIFT: mods.append("shift")
 
             if main == "Escape" and not mods:
                 status_var.set("已取消")
@@ -1616,7 +1555,7 @@ class PixelTriggerApp:
                 close(150)
                 return
 
-            if main not in KEYSYM_TO_MAC:
+            if not pb.is_supported_key(main):
                 status_var.set(f"❌  不支持的按键：{keysym}")
                 status_label.configure(fg=C_RED)
                 dlg.after(1000, lambda: (status_var.set("⌨️  等待按键…"),
@@ -1639,17 +1578,9 @@ class PixelTriggerApp:
 
     def start_eyedrop(self):
         state = {"done": False, "gx": 0, "gy": 0}
-        try:
-            err, ids, count = Quartz.CGGetActiveDisplayList(MAX_DISPLAYS, None, None)
-        except Exception:
+        screens = pb.list_displays()
+        if not screens:
             return
-        if not ids:
-            return
-        screens = []
-        for did in ids:
-            r = Quartz.CGDisplayBounds(did)
-            screens.append((int(r.origin.x), int(r.origin.y),
-                            int(r.size.width), int(r.size.height)))
         overlays = []
 
         def destroy_all():
@@ -1730,47 +1661,29 @@ class PixelTriggerApp:
             pass
 
     def _check_screen_perm(self):
-        try:
-            return bool(Quartz.CGPreflightScreenCaptureAccess())
-        except Exception:
-            return False
+        return pb.check_screen_perm()
 
     def _check_ax_perm(self):
-        if not HAS_AX or AXIsProcessTrusted is None:
-            return None
-        try:
-            return bool(AXIsProcessTrusted())
-        except Exception:
-            return None
+        return pb.check_ax_perm()
 
     def _request_screen_perm(self):
         """
         主动请求屏幕录制权限，触发系统授权弹窗。
 
-        macOS 的机制：应用必须调用 CGRequestScreenCaptureAccess() 才会弹出
-        系统授权框；用户同意后，「隐私与安全 → 屏幕录制」里才会出现该应用
-        的条目。只做 CGPreflightScreenCaptureAccess()（检测）永远不会弹窗，
-        设置里也就永远没有这个条目——这正是用户遇到的「跳过去没有条目」。
+        macOS 必须调用 CGRequestScreenCaptureAccess() 才会弹出授权框；
+        只做检测（CGPreflightScreenCaptureAccess）永远不会弹窗，设置里
+        也就永远没有条目。Windows 无此机制，平台层直接返回 True。
         """
-        try:
-            return bool(Quartz.CGRequestScreenCaptureAccess())
-        except Exception:
-            return False
+        return pb.request_screen_perm()
 
     def _request_ax_perm(self):
         """
         主动请求辅助功能权限，触发系统授权弹窗。
 
-        用 AXIsProcessTrustedWithOptions 并带 kAXTrustedCheckOptionPrompt=True
-        来强制弹窗。若该 API 不可用则退回 AXIsProcessTrusted()（只检测）。
+        macOS 用 AXIsProcessTrustedWithOptions + kAXTrustedCheckOptionPrompt
+        强制弹窗。Windows 无此机制，平台层直接返回 True。
         """
-        if AXIsProcessTrustedWithOptions is None:
-            return self._check_ax_perm()
-        try:
-            return bool(AXIsProcessTrustedWithOptions(
-                {"AXTrustedCheckOptionPrompt": True}))
-        except Exception:
-            return self._check_ax_perm()
+        return pb.request_ax_perm()
 
     def _tick_permissions(self):
         self._tick_permissions_once()
@@ -1968,6 +1881,9 @@ class PixelTriggerApp:
         """只刷新权限圆点颜色，不重新排定轮询。"""
         self.has_screen = self._check_screen_perm()
         self.has_ax = self._check_ax_perm()
+        # 无授权机制的平台（Windows）不创建权限控件，直接跳过 UI 刷新。
+        if self.screen_perm_dot is None or self.ax_perm_dot is None:
+            return
         if self.has_screen:
             self.screen_perm_dot.configure(fg=C_GREEN)
         else:
@@ -2031,12 +1947,7 @@ class PixelTriggerApp:
             self._request_screen_perm()
         except Exception:
             pass
-        try:
-            subprocess.run(["open",
-                "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"],
-                check=False)
-        except Exception:
-            pass
+        pb.open_screen_settings_page()
 
     def open_ax_settings(self):
         if self.has_ax is True:
@@ -2046,27 +1957,14 @@ class PixelTriggerApp:
             self._request_ax_perm()
         except Exception:
             pass
-        try:
-            subprocess.run(["open",
-                "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"],
-                check=False)
-        except Exception:
-            pass
+        pb.open_ax_settings_page()
 
     def select_region(self):
         result = {"x": None, "y": None, "w": None, "h": None}
-        try:
-            err, ids, count = Quartz.CGGetActiveDisplayList(MAX_DISPLAYS, None, None)
-        except Exception as e:
-            self.log_msg(f"⚠️ 无法获取显示器列表: {e}")
+        screens = pb.list_displays()
+        if not screens:
+            self.log_msg("⚠️ 无法获取显示器列表")
             return
-        if not ids:
-            return
-        screens = []
-        for did in ids:
-            r = Quartz.CGDisplayBounds(did)
-            screens.append((int(r.origin.x), int(r.origin.y),
-                            int(r.size.width), int(r.size.height)))
         overlays, canvas_info = [], []
         st = {"down": False, "dx": 0, "dy": 0, "fx": None, "fy": None, "moved": False}
 
@@ -2186,7 +2084,7 @@ class PixelTriggerApp:
             if first:
                 c.create_text(sw//2, 50,
                     text="按住拖拽，或点击两次（左上角 → 右下角）   按 ESC 取消",
-                    fill="white", font=("Helvetica Neue", 18, "bold"))
+                    fill="white", font=(pb.FONT_UI, 18, "bold"))
                 first = False
             c._ch = c.create_line(0,0,0,0, fill=C_MARK_RED, width=1, state="hidden")
             c._cv = c.create_line(0,0,0,0, fill=C_MARK_RED, width=1, state="hidden")
@@ -2522,12 +2420,7 @@ class PixelTriggerApp:
         dx = rx + (rw - dw) // 2
         dy = ry + (rh - dh) // 2
         try:
-            err, ids, count = Quartz.CGGetActiveDisplayList(MAX_DISPLAYS, None, None)
-            screens = []
-            for did in ids:
-                r = Quartz.CGDisplayBounds(did)
-                screens.append((int(r.origin.x), int(r.origin.y),
-                                int(r.size.width), int(r.size.height)))
+            screens = pb.list_displays()
             cx, cy = rx + rw // 2, ry + rh // 2
             target = None
             for (sx, sy, sw, sh) in screens:
@@ -2551,12 +2444,12 @@ class PixelTriggerApp:
         dlg.geometry(f"{dw}x{dh}+{dx}+{dy}")
         tk.Label(dlg, text="检测到参数已修改",
                  bg=C_WINDOW_BG, fg=C_TITLE,
-                 font=("Helvetica Neue", 14, "bold")).pack(pady=(24, 4))
+                 font=(pb.FONT_UI, 14, "bold")).pack(pady=(24, 4))
         tk.Label(dlg,
                  text="是否保存本次修改的参数到配置文件？\n"
                       "选择「不保存」则保留原配置。",
                  bg=C_WINDOW_BG, fg=C_SUBTEXT,
-                 font=("Helvetica Neue", 11),
+                 font=(pb.FONT_UI, 11),
                  justify="center").pack(pady=(0, 18))
         btns = tk.Frame(dlg, bg=C_WINDOW_BG)
         btns.pack()
@@ -2633,6 +2526,13 @@ if __name__ == "__main__":
     root = tk.Tk()
     try:
         root.tk.call("tk", "scaling", 1.2)
+    except Exception:
+        pass
+    # Windows 下设置窗口 / 任务栏图标（macOS 由 .app 的 icns 承担）
+    try:
+        _icon = get_app_icon_path()
+        if _icon:
+            root.iconbitmap(_icon)
     except Exception:
         pass
     app = PixelTriggerApp(root)

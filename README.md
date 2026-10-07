@@ -2,7 +2,7 @@
 
 > 像素触发器 · 蓝线识别自动翻页
 
-一个 macOS 应用，通过识别屏幕上指定区域的像素颜色变化，自动触发滚动或按键操作。典型用途是乐谱软件（如 MuseScore）的自动翻页：检测到播放光标经过指定区域后，自动向上/向下滚动页面。
+一个跨平台应用（macOS / Windows），通过识别屏幕上指定区域的像素颜色变化，自动触发滚动或按键操作。典型用途是乐谱软件（如 MuseScore）的自动翻页：检测到播放光标经过指定区域后，自动向上/向下滚动页面。
 
 ## 功能
 
@@ -16,6 +16,8 @@
 - 外观自动跟随：系统浅色/深色切换后 1 秒内自动换肤，无需重启
 
 ## 下载安装
+
+### macOS
 
 1. 从 Releases 页面下载最新的 `PixelTrigger-1.1.0.dmg`（或 `PixelTrigger.app.zip`）
 2. 打开 DMG，把 PixelTrigger 拖到「应用程序」文件夹；或解压 zip 后手动拖入
@@ -43,6 +45,17 @@
 > 二进制签名会变化，macOS 会把旧的辅助功能/屏幕录制授权视为「不再匹配」，
 > 表现为系统设置里仍显示已勾选、但应用右上角红点不变绿。
 > 解决办法：在系统设置里**取消勾选 → 重新勾选**一次即可（无需卸载）。
+
+### Windows
+
+1. 从 Releases 页面下载最新的 `PixelTrigger.exe`（单文件，免安装）
+2. 直接双击运行。首次运行若被 SmartScreen 拦截，点「更多信息 → 仍要运行」即可
+   （应用未做代码签名，属正常提示）
+3. Windows 上**无需授予任何权限**，打开后直接框选区域、点「开始监控」即可
+
+> 该 exe 由 GitHub Actions 在云端 Windows 环境自动构建（`PyInstaller` 不支持
+> 交叉编译，Windows 程序只能在 Windows 上打包），配置见
+> `.github/workflows/build-windows.yml`。
 
 ## 使用方法
 
@@ -77,11 +90,23 @@
 
 ## 从源码运行
 
-安装依赖：`pip3 install --user Pillow pyobjc-framework-Quartz`
+macOS：
 
-运行：`python3 color_watcher.py`
+```bash
+pip3 install --user Pillow pyobjc-framework-Quartz pyobjc-framework-ApplicationServices
+python3 color_watcher.py
+```
 
-## 自行打包为 .app
+Windows：
+
+```bat
+python -m pip install Pillow
+python color_watcher.py
+```
+
+## 自行打包
+
+### macOS（.app / .dmg）
 
 推荐使用仓库内置的一键打包脚本：
 
@@ -110,10 +135,37 @@ codesign --force --deep --sign - dist/PixelTrigger.app
 
 产物在 `dist/PixelTrigger.app`。
 
+### Windows（.exe）
+
+在 Windows 上双击 `build_win.bat`（或在命令行执行），脚本会自动创建虚拟环境、
+安装 PyInstaller 与 Pillow，并打包出单文件 `dist\PixelTrigger.exe`：
+
+```bat
+build_win.bat
+```
+
+> Windows 的 exe **必须在 Windows 上打包**（PyInstaller 不支持交叉编译）。
+> 仓库已配置 GitHub Actions，推送到 main 或打 tag 时会在云端 Windows 机器
+> 自动构建，产物可在仓库的 Actions → Build Windows EXE → Artifacts 下载。
+
 ## 系统要求
 
-- macOS 11 或更高
-- 需要屏幕录制 + 辅助功能权限
+- **macOS** 11 或更高（需要屏幕录制 + 辅助功能权限）
+- **Windows** 10 / 11（无需额外权限）
+
+## 跨平台架构
+
+系统级差异（截图、键鼠模拟、显示器枚举、系统深浅色、权限、配置目录）全部收口在
+`platform_backend.py`，主程序 `color_watcher.py` 保持平台无关：
+
+| 能力 | macOS | Windows |
+|---|---|---|
+| 屏幕截图 | Quartz.CGWindowListCreateImage | PIL.ImageGrab |
+| 滚轮 / 键盘 | CGEvent | mouse_event / keybd_event |
+| 显示器枚举 | CGGetActiveDisplayList | EnumDisplayMonitors |
+| 系统深浅色 | CFPreferences | 注册表 AppsUseLightTheme |
+| 权限 | TCC（屏幕录制 + 辅助功能） | 无（无需授权） |
+| 配置目录 | ~/Library/Application Support | %APPDATA% |
 
 ## 支持
 
