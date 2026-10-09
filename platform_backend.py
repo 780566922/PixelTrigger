@@ -13,7 +13,7 @@ macOS 与 Windows。
   能力            macOS                          Windows
   ------------    ---------------------------    ----------------------------------
   截图            Quartz.CGWindowListCreateImage GDI BitBlt (ctypes)
-  滚轮            CGEvent 像素级                  mouse_event(MOUSEEVENTF_WHEEL) 格级
+  滚轮            CGEvent 像素级                  mouse_event 细粒度增量（120=1格）
   键盘            CGEvent + 虚拟键码              keybd_event + VK 码
   显示器枚举      CGGetActiveDisplayList          EnumDisplayMonitors
   DPI 感知        系统原生（Retina 由 CG 处理）   进程级声明 Per-Monitor v2
@@ -490,14 +490,26 @@ def _mac_grab(x, y, w, h):
 # 滚轮
 # ============================================================
 
-# macOS 是像素级滚动；Windows 的 mouse_event 只能按「格」(WHEEL_DELTA=120)。
-# 用累积器把连续的像素量换算成整格，避免小步长被取整丢光。
+# macOS 是像素级滚动；Windows 的滚轮事件以「格」为标定（一格 = 120）。
+# 1 格按 100 内容像素标定（与浏览器默认单格滚动量一致）。
+# 用累积器换算并保留小数余量，保证动画总量精确、无系统性偏差。
 _WIN_PIXELS_PER_CLICK = 100.0
 _win_scroll_accum = 0.0
 
 
 def post_scroll(pixels):
-    """发送一次滚轮事件。pixels 为像素量，正值表示向上滚动（内容下移）。"""
+    """发送一次滚轮事件。pixels 为像素量，正值表示向上滚动（内容下移）。
+
+    Windows 的 WM_MOUSEWHEEL 接受任意整数增量（不必是 120 的倍数）：
+    按帧发送细粒度增量即可获得连续顺滑的滚动。旧实现按整格量化
+    （每积累 100px 才发一格），平滑动画被压缩成 3~4 次大跳变，
+    表现为一顿一顿（v1.2.1 的问题）。
+
+    兼容性说明：极少数按「delta/120 整数除法、逐事件截断」处理的老
+    程序会对小于一格的增量无响应；现代程序（浏览器、Qt 5.12+/Qt6、
+    Office 等）均支持高精度增量。若目标程序出现「完全不滚动」，可
+    回退整格量化模式（见 _win_legacy_notch_scroll）。
+    """
     global _win_scroll_accum
     try:
         pixels = float(pixels)
@@ -512,6 +524,27 @@ def post_scroll(pixels):
             pass
         return
 
+    # 像素 -> 滚轮增量（1 格 = _WIN_PIXELS_PER_CLICK 像素），小数余量
+    # 留在累积器里随后续帧发出，动画总量与设定像素数严格一致。
+    _win_scroll_accum += pixels * (120.0 / _WIN_PIXELS_PER_CLICK)
+    delta = int(_win_scroll_accum)   # 朝零取整，余量按原符号保留
+    if delta == 0:
+        return
+    _win_scroll_accum -= delta
+    try:
+        import ctypes
+        MOUSEEVENTF_WHEEL = 0x0800
+        ctypes.windll.user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta, 0)
+    except Exception:
+        pass
+
+
+def _win_legacy_notch_scroll(pixels):
+    """整格量化滚动（兼容模式）：每积累 100px 发一格。
+
+    仅供目标程序对细粒度增量无响应时手动替换使用。
+    """
+    global _win_scroll_accum
     _win_scroll_accum += pixels
     clicks = int(_win_scroll_accum / _WIN_PIXELS_PER_CLICK)
     if clicks == 0:
@@ -522,6 +555,18 @@ def post_scroll(pixels):
         MOUSEEVENTF_WHEEL = 0x0800
         ctypes.windll.user32.mouse_event(
             MOUSEEVENTF_WHEEL, 0, 0, int(clicks * 120), 0)
+    except Exception:
+        pass
+
+
+# smooth_scroll 以 120fps 发送增量并依赖 time.sleep(1/120)。Windows 默认
+# 定时器精度约 15.6ms，会把每次 sleep 拉长到 ~15ms，动画帧率掉到 60fps
+# 上下且抖动明显。把系统定时器精度提到 1ms（进程存活期间全局生效，
+# 滚动/按键类工具的标准做法），动画才能跑满设定的帧率。
+if IS_WIN:
+    try:
+        import ctypes
+        ctypes.windll.winmm.timeBeginPeriod(1)
     except Exception:
         pass
 
