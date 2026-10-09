@@ -30,7 +30,7 @@ jobs:
           python -m pip install pyinstaller Pillow
 
       - name: Syntax check
-        run: python -m py_compile color_watcher.py platform_backend.py
+        run: python -m py_compile color_watcher.py platform_backend.py dpi_diag.py
 
       - name: Build EXE
         run: pyinstaller --noconfirm --clean --onefile --windowed --name PixelTrigger --icon icon.ico --add-data "donation.png;." --add-data "icon.ico;." --hidden-import platform_backend --hidden-import PIL.ImageGrab color_watcher.py

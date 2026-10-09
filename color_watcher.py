@@ -100,6 +100,10 @@ DEFAULT_CONFIG = {
     "key_combo": "Next", "key_action": "press",
     "key_repeat_count": "3", "key_repeat_interval": "0.5",
     "key_hold_duration": "1.0",
+    # 框选坐标所属空间标记：Windows 声明 Per-Monitor DPI Aware 后坐标
+    # 为物理像素（"physical"）；缺失或为旧值表示 v1.2.0 之前的
+    # 「DPI 虚拟化逻辑像素」坐标，加载时按缩放系数迁移。
+    "coord_space": "",
 }
 
 PREVIEW_INTERVAL = 1.0
@@ -396,7 +400,7 @@ class FancyButton:
 def capture_region(x, y, w, h):
     """截取屏幕矩形区域，返回 PIL.Image(RGB)；失败返回 None。
 
-    macOS 走 Quartz，Windows 走 PIL.ImageGrab，差异已由平台层封装。
+    macOS 走 Quartz，Windows 走 GDI（ctypes），差异已由平台层封装。
     """
     return pb.grab_region(x, y, w, h)
 
@@ -811,6 +815,24 @@ class PixelTriggerApp:
                         cfg[k] = str(val)
             except Exception:
                 pass
+        # Windows 坐标空间迁移：v1.2.0 及更早版本的框选坐标记录在
+        # 「DPI 虚拟化逻辑像素」空间；启用 Per-Monitor DPI Aware 后为
+        # 物理像素。检测到旧格式时按系统 DPI 缩放系数一次性换算。
+        if pb.IS_WIN and cfg.get("coord_space") != "physical":
+            s = pb.win_display_scale()
+            if abs(s - 1.0) > 1e-6:
+                for k in ("x", "y", "w", "h"):
+                    try:
+                        cfg[k] = str(int(round(float(cfg[k]) * s)))
+                    except Exception:
+                        pass
+            # 标记已迁移并立即回写磁盘，防止下次启动对坐标重复放大
+            cfg["coord_space"] = "physical"
+            try:
+                with open(CONFIG_FILE, "w") as f:
+                    json.dump(cfg, f, indent=2)
+            except Exception:
+                pass
         return cfg
 
     def save_config(self):
@@ -826,6 +848,8 @@ class PixelTriggerApp:
                 "hue_g": str(self.selected_hue[1]),
                 "hue_b": str(self.selected_hue[2]),
                 "hue_tol": str(self.hue_tol),
+                # Windows 框选坐标空间标记（物理像素），供版本升级迁移
+                "coord_space": "physical" if pb.IS_WIN else "points",
             })
             with open(CONFIG_FILE, "w") as f:
                 json.dump(data, f, indent=2)
@@ -2524,8 +2548,18 @@ if __name__ == "__main__":
     apply_theme(detect_system_theme())
 
     root = tk.Tk()
+    # 登记 Tk 视角的屏幕尺寸，供 Windows 侧自校准坐标空间
+    # （platform_backend.set_ui_screen_size；其他平台为空操作）。
     try:
-        root.tk.call("tk", "scaling", 1.2)
+        pb.set_ui_screen_size(root.winfo_screenwidth(),
+                              root.winfo_screenheight())
+    except Exception:
+        pass
+    try:
+        # Windows 进程已声明 Per-Monitor DPI Aware，DWM 不再做位图放大，
+        # 字号按系统 DPI 同比例补偿（96dpi 时即原值 1.2），视觉大小与
+        # 旧版一致且文字更清晰。macOS 维持 1.2（win_display_scale 恒 1）。
+        root.tk.call("tk", "scaling", 1.2 * pb.win_display_scale())
     except Exception:
         pass
     # Windows 下设置窗口 / 任务栏图标（macOS 由 .app 的 icns 承担）

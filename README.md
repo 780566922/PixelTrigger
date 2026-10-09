@@ -19,7 +19,7 @@
 
 ### macOS
 
-1. 从 Releases 页面下载最新的 `PixelTrigger-1.2.0.dmg`（或 `PixelTrigger.app.zip`）
+1. 从 Releases 页面下载最新的 `PixelTrigger-1.2.1.dmg`（或 `PixelTrigger.app.zip`）
 2. 打开 DMG，把 PixelTrigger 拖到「应用程序」文件夹；或解压 zip 后手动拖入
 3. 第一次打开：右键点击 App，选择「打开」，弹窗里再点「打开」
 4. 授权：
@@ -52,6 +52,12 @@
 2. 直接双击运行。首次运行若被 SmartScreen 拦截，点「更多信息 → 仍要运行」即可
    （应用未做代码签名，属正常提示）
 3. Windows 上**无需授予任何权限**，打开后直接框选区域、点「开始监控」即可
+
+> **高 DPI / 显示缩放**：应用在启动时声明 Per-Monitor DPI Aware，
+> 缩放（125% / 150% / 200%）与高刷新率高分屏下框选区域与实际监控
+> 区域保持一致（v1.2.1 修复：旧版在缩放屏幕上框选会偏移）。
+> 若遇到坐标异常，可在源码目录运行 `python dpi_diag.py --grab`
+> 输出各坐标源的诊断信息，便于反馈定位。
 
 > 该 exe 由 GitHub Actions 在云端 Windows 环境自动构建（`PyInstaller` 不支持
 > 交叉编译，Windows 程序只能在 Windows 上打包），配置见

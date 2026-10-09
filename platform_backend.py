@@ -12,10 +12,15 @@ macOS 与 Windows。
 平台差异一览：
   能力            macOS                          Windows
   ------------    ---------------------------    ----------------------------------
-  截图            Quartz.CGWindowListCreateImage PIL.ImageGrab
+  截图            Quartz.CGWindowListCreateImage GDI BitBlt (ctypes)
   滚轮            CGEvent 像素级                  mouse_event(MOUSEEVENTF_WHEEL) 格级
   键盘            CGEvent + 虚拟键码              keybd_event + VK 码
   显示器枚举      CGGetActiveDisplayList          EnumDisplayMonitors
+  DPI 感知        系统原生（Retina 由 CG 处理）   进程级声明 Per-Monitor v2
+
+Windows DPI 说明：进程启动时显式声明 Per-Monitor DPI Aware v2，
+此后 Tk 坐标 / EnumDisplayMonitors / GDI 截图三者统一为物理像素，
+缩放（125%/150%/200%）下框选区域与实际监控区域严格一致。
   系统深浅色      CFPreferences / defaults        winreg AppsUseLightTheme
   权限            屏幕录制 + 辅助功能（TCC）      无（恒为已授权）
   配置目录        ~/Library/Application Support   %APPDATA%
@@ -31,6 +36,127 @@ try:  # macOS 专有，Windows 上为 None
     import Quartz
 except Exception:  # pragma: no cover - 仅在非 mac 平台触发
     Quartz = None
+
+
+# ============================================================
+# Windows DPI 感知（缩放屏幕坐标一致性的根基）
+# ============================================================
+
+def _win_enable_dpi_awareness():
+    """把进程显式声明为 Per-Monitor DPI Aware v2。
+
+    必须在本进程创建任何窗口（HWND）之前调用——本模块被主程序在
+    import 阶段引用，早于 tk.Tk() 创建根窗口，满足时序要求。
+
+    声明成功后的坐标约定：
+      * GetSystemMetrics / EnumDisplayMonitors 返回物理像素；
+      * GDI BitBlt 截图与物理像素逐像素对应；
+      * Tk 的窗口几何与鼠标事件坐标同为物理像素。
+    三者一致，显示缩放（125%/150%/200%）不再引起框选偏移。
+
+    同时这绕开了 PIL.ImageGrab 的一个坑：其 win32 截图实现会临时把
+    调用线程切到 PER_MONITOR_AWARE 再取屏幕尺寸（物理像素），而截图
+    DC 与调用方坐标仍处于进程的 DPI 虚拟化空间（逻辑像素），两个
+    坐标系混用导致缩放屏幕上「框选区域 ≠ 实际截图区域」。进程声明
+    PMv2 后，线程级切换不再改变坐标语义。
+
+    若已被清单/其他组件声明过，Win32 调用会返回 FALSE（拒绝访问），
+    属预期，直接忽略。
+    """
+    import ctypes
+    user32 = ctypes.windll.user32
+
+    # Win10 1607+：Per-Monitor v2（首选）
+    try:
+        user32.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+        user32.SetProcessDpiAwarenessContext.restype = ctypes.c_int
+        # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = ((DPI_CONTEXT_HANDLE)-4)
+        if user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+            return "per-monitor-v2"
+    except Exception:
+        pass
+
+    # Win8.1+：按监视器感知
+    try:
+        # PROCESS_PER_MONITOR_DPI_AWARE = 2
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        return "per-monitor"
+    except Exception:
+        pass
+
+    # Vista+ 兜底：系统级 DPI 感知
+    try:
+        if user32.SetProcessDPIAware():
+            return "system"
+    except Exception:
+        pass
+    return "unaware"
+
+
+def win_display_scale():
+    """返回系统（主屏）DPI 缩放系数，96 DPI 为 1.0（如 150% 返回 1.5）。
+
+    用于：UI 字号补偿（见主程序 tk scaling 设置）与旧配置坐标迁移。
+    进程未声明 DPI 感知时虚拟化会让本函数返回 1.0，此时维持旧行为。
+    """
+    if not IS_WIN:
+        return 1.0
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        try:
+            dpi = user32.GetDpiForSystem()
+            if dpi and int(dpi) > 0:
+                return int(dpi) / 96.0
+        except Exception:
+            pass
+        hdc = user32.GetDC(0)
+        try:
+            dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)  # LOGPIXELSX
+        finally:
+            user32.ReleaseDC(0, hdc)
+        if dpi and int(dpi) > 0:
+            return int(dpi) / 96.0
+    except Exception:
+        pass
+    return 1.0
+
+
+# UI 坐标空间自校准：主程序创建 Tk 根窗口后登记 Tk 视角的屏幕尺寸。
+# 正常情况下（进程已声明 PMv2）Tk 与 Win32 同为物理像素，比值为 1；
+# 若未来某环境（老版 Tcl/Tk、第三方组件改动感知级别）使两者不一致，
+# 按宽度比值换算，保证框选与截图始终落在同一坐标系。
+_UI_SCREEN = {"w": None}
+
+
+def set_ui_screen_size(w, h):
+    """登记 Tk 视角的主屏尺寸（供 Windows 坐标自校准，其他平台无操作）。"""
+    if not IS_WIN:
+        return
+    try:
+        if int(w) > 0:
+            _UI_SCREEN["w"] = int(w)
+    except Exception:
+        pass
+
+
+def _win_coord_ratio():
+    """UI（Tk）坐标空间 -> Win32 物理像素 的换算比，无法判定时为 1.0。"""
+    try:
+        import ctypes
+        win_w = ctypes.windll.user32.GetSystemMetrics(0)  # SM_CXSCREEN
+        ui_w = _UI_SCREEN["w"]
+        if win_w and ui_w and abs(win_w - ui_w) > 1:
+            r = float(win_w) / float(ui_w)
+            if 0.2 <= r <= 8.0:
+                return r
+    except Exception:
+        pass
+    return 1.0
+
+
+if IS_WIN:
+    _win_enable_dpi_awareness()
 
 
 # ============================================================
@@ -192,6 +318,15 @@ def _win_displays():
         user32.EnumDisplayMonitors(0, 0, proc_type(_cb), 0)
     except Exception:
         pass
+    # 自校准：若 Tk 坐标空间与 Win32 不一致，把显示器矩形换算回 UI
+    # 空间（正常声明 PMv2 后比值为 1，此处不产生任何偏移）。
+    try:
+        r = _win_coord_ratio()
+        if r != 1.0:
+            out = [(round(x / r), round(y / r), round(w / r), round(h / r))
+                   for (x, y, w, h) in out]
+    except Exception:
+        pass
     return out
 
 
@@ -213,12 +348,114 @@ def grab_region(x, y, w, h):
 
 
 def _win_grab(x, y, w, h):
+    """Windows 截图：优先 ctypes GDI BitBlt，失败回退 PIL.ImageGrab。
+
+    坐标约定：入参为 UI（Tk）空间坐标，内部先换算为 Win32 物理像素。
+    不再以 PIL.ImageGrab 为主路径——其 win32 实现会在截图期间临时把
+    线程切到 PER_MONITOR_AWARE，导致「屏幕尺寸按物理像素、截图 DC 与
+    调用方坐标按虚拟化逻辑像素」的坐标系混用，缩放屏幕上框选区域与
+    实际截图区域错位（v1.2.0 的缺陷）。GDI 路径与本模块
+    EnumDisplayMonitors 同属一个坐标空间，彻底消除该不一致。
+    """
+    # UI 空间 -> 物理像素
+    try:
+        r = _win_coord_ratio()
+        if r != 1.0:
+            x, y = int(round(x * r)), int(round(y * r))
+            w, h = int(round(w * r)), int(round(h * r))
+    except Exception:
+        pass
+    if w <= 0 or h <= 0 or w > 32767 or h > 32767:
+        return None
+
+    img = _win_grab_gdi(x, y, w, h)
+    if img is not None:
+        return img
+    # 兜底：老实现（GDI 初始化失败等极端情况）
     try:
         from PIL import ImageGrab
-        # all_screens=True 使用虚拟桌面坐标（与 list_displays 一致），
-        # 可正确截取副屏；要求 Pillow >= 8.2。
         img = ImageGrab.grab(bbox=(x, y, x + w, y + h), all_screens=True)
         return img.convert("RGB")
+    except Exception:
+        return None
+
+
+def _win_grab_gdi(x, y, w, h):
+    """ctypes GDI 截屏，坐标为 Win32 物理像素；失败返回 None。"""
+    try:
+        import ctypes
+        from PIL import Image
+    except Exception:
+        return None
+    try:
+        user32 = ctypes.windll.user32
+        gdi32 = ctypes.windll.gdi32
+        SRCCOPY = 0x00CC0020
+        CAPTUREBLT = 0x40000000
+
+        # 裁剪到虚拟屏，避免越界矩形（GDI 会静默填黑或失败）
+        vx = user32.GetSystemMetrics(76)   # SM_XVIRTUALSCREEN
+        vy = user32.GetSystemMetrics(77)   # SM_YVIRTUALSCREEN
+        vw = user32.GetSystemMetrics(78)   # SM_CXVIRTUALSCREEN
+        vh = user32.GetSystemMetrics(79)   # SM_CYVIRTUALSCREEN
+        x2, y2 = min(x + w, vx + vw), min(y + h, vy + vh)
+        x, y = max(x, vx), max(y, vy)
+        w, h = x2 - x, y2 - y
+        if w <= 0 or h <= 0:
+            return None
+
+        class BMIH(ctypes.Structure):
+            _fields_ = [
+                ("biSize", ctypes.c_uint32), ("biWidth", ctypes.c_long),
+                ("biHeight", ctypes.c_long), ("biPlanes", ctypes.c_uint16),
+                ("biBitCount", ctypes.c_uint16),
+                ("biCompression", ctypes.c_uint32),
+                ("biSizeImage", ctypes.c_uint32),
+                ("biXPelsPerMeter", ctypes.c_long),
+                ("biYPelsPerMeter", ctypes.c_long),
+                ("biClrUsed", ctypes.c_uint32),
+                ("biClrImportant", ctypes.c_uint32)]
+
+        hwnd = user32.GetDesktopWindow()
+        hdc = user32.GetWindowDC(hwnd)
+        if not hdc:
+            return None
+        chdc = bmp = None
+        try:
+            chdc = gdi32.CreateCompatibleDC(hdc)
+            bmp = gdi32.CreateCompatibleBitmap(hdc, w, h)
+            if not chdc or not bmp:
+                return None
+            old = gdi32.SelectObject(chdc, bmp)
+            ok = gdi32.BitBlt(chdc, 0, 0, w, h, hdc, x, y, SRCCOPY | CAPTUREBLT)
+            # GetDIBits 要求位图未选入任何 DC，先还原
+            gdi32.SelectObject(chdc, old)
+            if not ok:
+                return None
+            bi = BMIH()
+            bi.biSize = ctypes.sizeof(BMIH)
+            bi.biWidth = w
+            bi.biHeight = -h        # 负值 = 自顶向下行序
+            bi.biPlanes = 1
+            bi.biBitCount = 32
+            bi.biCompression = 0    # BI_RGB
+            stride = w * 4
+            buf = (ctypes.c_ubyte * (stride * h))()
+            if gdi32.GetDIBits(chdc, bmp, 0, h, buf,
+                               ctypes.byref(bi), 0) != h:
+                return None
+            # BGRX：32bpp DIB 的行字节序（B,G,R,填充），frombuffer 会
+            # 解码拷贝进 PIL Image，不依赖调用方缓冲区生命周期
+            return Image.frombuffer("RGB", (w, h), buf,
+                                    "raw", "BGRX", stride, 1)
+        except Exception:
+            return None
+        finally:
+            if bmp:
+                gdi32.DeleteObject(bmp)
+            if chdc:
+                gdi32.DeleteDC(chdc)
+            user32.ReleaseDC(hwnd, hdc)
     except Exception:
         return None
 

@@ -13,7 +13,7 @@ from setuptools import setup
 
 APP = ['color_watcher.py']
 
-VERSION = '1.2.0'
+VERSION = '1.2.1'
 
 # pyobjc 框架以 .so 形式提供，必须显式纳入打包范围
 PYOBJC_MODULES = [
