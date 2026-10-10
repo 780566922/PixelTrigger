@@ -157,10 +157,13 @@ DEFAULT_CONFIG = {
     "total_pixels": "325", "duration": "0.65",
     # Windows 专属滚轮调优（macOS 的 CGEvent 是像素级滚动，不使用该项）：
     #   win_scroll_density 滚动密度，1.0 = 每 100 像素 1 格（120）。
-    #                      它决定「总距离」被拆成多少格（多少步）：
-    #                          格数 = 总距离 / (100 / 密度)
-    #                      调高＝步数更多、滚动更顺滑，但总跨度不变；
-    #                      「总距离」才严格决定滚动总跨度（两者正交）。
+    #                      它决定「总距离」换算成多少滚轮单位：
+    #                          滚轮单位 = 总距离 × 密度 × 1.2
+    #                      顺滑度由 post_scroll 用 PostMessage 亚格增量
+    #                      逐帧下发自动保证（触摸板级连续滑动），密度 1.0
+    #                      即足够顺滑；调高密度会让滚动更顺滑，但同时
+    #                      滚动总量也同比例变大（「总距离」与「密度」
+    #                      共同决定总跨度）。
     "win_scroll_density": "1.0",
     "key_combo": "Next", "key_action": "press",
     "key_repeat_count": "3", "key_repeat_interval": "0.5",
@@ -485,10 +488,10 @@ def smooth_scroll(total_pixels, duration, direction, stop_event):
     macOS：CGEvent 是像素级滚动，逐帧下发像素量即可连续平滑。
 
     Windows：滚轮以「格」为标定（WHEEL_DELTA = 120）。本函数按像素
-    缓动逐帧下发像素量，由平台层的 post_scroll **按整格累积**后再发
-    出 120 的整数倍事件——这保证「总距离」严格线性地决定格数，且每格
-    都是标准整格增量，方向与幅度经 mouse_event 正确传递，不再被
-    亚格微增量的 DWORD 截断压平（旧实现的问题根源）。
+    缓动逐帧下发像素量，由平台层的 post_scroll 用 PostMessage 直投
+    WM_MOUSEWHEEL 的**亚格增量**（wheelDelta 为有符号值）逐帧下发，
+    每帧的小步进直接变成连续的小滚轮增量——这就是触摸板那种顺滑，
+    同时「总距离」严格线性地决定总跨度（1 格 = 100 像素）。
 
     帧推进使用「绝对时间表」而非逐帧 sleep(interval)：后者会把每次
     sleep 的过量等待累加进来，Windows 下单次误差常有 1~3ms，几十帧下来
@@ -1407,12 +1410,11 @@ class PixelTriggerApp:
             f3.pack(side="left")
             ToolTip(e3,
                     "Windows 滚轮粒度：1.0 = 每 100 像素 1 格。\n"
-                    "「总距离」决定滚动总跨度，「密度」只决定它被拆成\n"
-                    "多少格（多少步），两者互不影响。\n"
-                    "调高密度 → 每格更小、步数更多、滚动更顺滑；\n"
-                    "         总跨度不变（仍是「总距离」那么多）。\n"
-                    "调低密度 → 步数更少、更有「一格一格」的顿挫感。\n"
-                    "建议配合「试滚」实测，通常 3~6 顺滑度较好。")
+                    "「总距离」决定滚动总跨度；顺滑度由亚格增量下发\n"
+                    "自动保证（像触摸板那样连续滑动），密度 1.0 即顺滑。\n"
+                    "调高密度 → 每格更小、滚动更顺滑，但同样总距离\n"
+                    "          对应的滚动总量也同比例变大。\n"
+                    "一般保持 1.0 即可，配合「试滚」按需微调。")
             test_btn = ttk.Button(sr3, text="试滚", width=4,
                                   command=self.test_scroll)
             test_btn.pack(side="left", padx=(8, 0), anchor="s", pady=(0, 1))

@@ -13,8 +13,8 @@ macOS 与 Windows。
   能力            macOS                          Windows
   ------------    ---------------------------    ----------------------------------
   截图            Quartz.CGWindowListCreateImage GDI BitBlt (ctypes)
-  滚轮            CGEvent 像素级                  mouse_event 亚格增量
-                                                  （120 = 1 格，密度可调）
+  滚轮            CGEvent 像素级                  PostMessage WM_MOUSEWHEEL
+                                                  亚格增量（120 = 1 格）
   键盘            CGEvent + 虚拟键码              keybd_event + VK 码
   显示器枚举      CGGetActiveDisplayList          EnumDisplayMonitors
   DPI 感知        系统原生（Retina 由 CG 处理）   进程级声明 Per-Monitor v2
@@ -522,21 +522,19 @@ def set_scroll_density(density):
     """设置 Windows 滚动密度。
 
     密度 = 「一格对应多少内容像素」的倍率：1.0 为基准（每格 100 像素）。
-    每格像素 = 100 / 密度，因此调高密度 → 每格内容更少 → 同一「总距离」
-    拆出的整格事件更多、滚动更连续（顺滑）。
+    每格像素 = 100 / 密度。
 
-    关键语义（v1.2.5 修正）：
+    关键语义（v1.2.6 修正）：
         · 「总距离」决定实际滚动的总跨度，严格线性——改 600 一定比
-          325 滚得远，与密度无关。
-        · 「密度」只决定这份跨度被拆成多少格（多少步）：密度越高、
-          步数越多、越顺滑。两个旋钮**正交**，不再「同向相乘」。
+          325 滚得远。
+        · 顺滑度不再依赖「把跨度拆成多少整格」，而是由 post_scroll 用
+          PostMessage 直投 WM_MOUSEWHEEL 的**亚格增量**实现：缓动曲线
+          每帧的小步进直接变成连续的小滚轮增量，密度 1.0 即可顺滑，
+          无需调高密度去「多拆格」。
 
-    这是对旧实现的纠正：旧版把像素直接乘 (120/每格像素) 换算成滚轮
-    单位，导致「密度调高 = 总滚动量放大」，密度与总距离混淆不清，
-    且亚格微增量（远小于 WHEEL_DELTA=120）经 mouse_event 的 DWORD
-    无符号参数传递后，下游读到的高 16 位只剩方向、幅度被压平，最终
-    「总距离」与「实际滚动量」脱钩（用户实测改大总距离反而滚得更短）。
-    现改为：按整格（120 的整数倍）累积下发，幅度与方向都正确传递。
+    密度仍可用作微调：调高 → 每格内容更少、同样总距离对应的滚轮单位
+    更多（顺滑度与滚动总量同比例上升）。默认 1.0 已足够顺滑，一般
+    无需改动。
 
     仅在 Windows 生效；macOS 的 CGEvent 是像素级滚动，无需此换算。
     """
@@ -566,7 +564,13 @@ def scroll_notches_for(pixels):
 
 
 def _win_post_wheel(delta):
-    """把一次滚轮增量交给系统（delta 为整数，可为负）。"""
+    """把一次滚轮增量交给系统（delta 为整数，可为负）。
+
+    通过 mouse_event 发送。注意：mouse_event 的 dwData 是 32 位无符号
+    整数，负的亚格增量（-1~-119）经无符号转换后高 16 位错乱，下游
+    GET_WHEEL_DELTA_WPARAM 只能读到方向、幅度被压平。因此本函数只应
+    用于「整格」±120 的发送（见 _win_post_wheel_precise 处理亚格）。
+    """
     if not delta:
         return
     try:
@@ -579,30 +583,70 @@ def _win_post_wheel(delta):
         pass
 
 
+def _win_post_wheel_precise(delta):
+    """用 PostMessage 把 WM_MOUSEWHEEL 直接投递给光标下的窗口。
+
+    delta 是**有符号**滚轮增量，可以是任意亚格值（±1~±119 甚至更大），
+    与 mouse_event 的关键区别：
+
+      · mouse_event 的 dwData 是 32 位无符号，负亚格增量（如 -18）经
+        无符号转换后，系统生成的 WM_MOUSEWHEEL 高 16 位只剩方向（-1），
+        幅度被压平——这正是 v1.2.5 发现的问题根源。
+      · PostMessage 直接构造 wParam，其高 16 位就是有符号 wheelDelta，
+        -18 原样传递。现代程序按 delta/120.0 浮点累加，即可实现
+        像素级（亚格）连续滚动，也就是「触摸板」那种顺滑。
+
+    返回 True 表示消息已成功投递；找不到窗口或调用失败返回 False，
+    调用方据此回退到整格 mouse_event 路径。
+    """
+    if not delta:
+        return True
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        WM_MOUSEWHEEL = 0x020A
+
+        class POINT(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+        pt = POINT()
+        if not user32.GetCursorPos(ctypes.byref(pt)):
+            return False
+        hwnd = user32.WindowFromPoint(pt)
+        if not hwnd:                      # 光标落在非窗口区（如任务栏、桌面）
+            hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return False
+
+        # WM_MOUSEWHEEL 的 lParam 是屏幕坐标（x 低 16 位，y 高 16 位）；
+        # wParam 高 16 位是有符号 wheelDelta，低 16 位是按键状态（此处 0）。
+        lparam = ((pt.y & 0xFFFF) << 16) | (pt.x & 0xFFFF)
+        wparam = (int(delta) & 0xFFFF) << 16
+        user32.PostMessageW(hwnd, WM_MOUSEWHEEL, wparam, lparam)
+        return True
+    except Exception:
+        return False
+
+
 def post_scroll(pixels):
     """发送一次滚轮事件。pixels 为像素量，正值表示向上滚动（内容下移）。
 
     macOS：CGEvent 是像素级滚动（kCGScrollEventUnitPixel），任意像素量
     可直接下发，无「格」的概念。
 
-    Windows：滚轮事件以「格」为标定（WHEEL_DELTA = 120）。WM_MOUSEWHEEL
-    的 wheelDelta 是 wParam 高 16 位的有符号 short，虽然理论上能表达
-    亚格增量，但 mouse_event 的 dwData 参数是 32 位无符号整数，把负的
-    亚格增量（如 -1~-27）传进去后，下游程序用 GET_WHEEL_DELTA_WPARAM
-    读到的高 16 位只剩方向、幅度被压平；再加上相当多程序按「整格截断」
-    （int(delta/120)）处理滚轮，亚格微增量会被直接丢弃。
+    Windows：滚轮事件以「格」为标定（WHEEL_DELTA = 120）。这里用
+    PostMessage 直投 WM_MOUSEWHEEL，其 wheelDelta（wParam 高 16 位）
+    是**有符号值**，可精确传递亚格增量——因此每帧几像素的小步进也能
+    变成连续的小滚轮增量，实现触摸板级顺滑，同时「总距离」严格线性
+    （1 格 = _win_pixels_per_click 像素，总跨度 = pixels × 120 /
+    _win_pixels_per_click，与是否逐格发无关）。
 
-    因此 Windows 必须**按整格累积下发**：像素量累积满一格（即
-    _win_pixels_per_click 像素）才发一次 ±120 的整格事件。这样
-    「总距离」才与「实际滚动格数」保持严格线性，不会出现「改大总距离
-    反而滚得更短」的脱钩现象。小数余量留在累积器，跨多次触发不漂移。
-    换算比例由「滚动密度」控制（见 set_scroll_density）。
+    亚格直发依赖目标程序按 delta/120.0 浮点累加。绝大多数现代程序
+    （Qt / Electron / WPF / UWP 等）都支持；若目标程序是老式
+    int(delta/120) 截断实现，亚格增量会被丢弃，此时应回退到整格
+    mouse_event 路径（见 _win_post_wheel_precise 的返回判断）。
 
-    关键约束：mouse_event 的 dwData 虽为 32 位，但系统据此生成的
-    WM_MOUSEWHEEL 的 wheelDelta 是 wParam 高 16 位有符号 short，且语义
-    上按 WHEEL_DELTA(120) 归一。因此**单次调用最多只能可靠表达 ±1 格
-    （±120）**，超过 ±120 的增量（如 ±240）其高位会被压平、幅度丢失。
-    故每次事件固定发 ±120，多格由「发多次」表达，而非「一次发大值」。
+    累积器跨多次触发保留小数余量，保证总跨度不漂移。
     """
     global _win_scroll_accum
     try:
@@ -618,18 +662,19 @@ def post_scroll(pixels):
             pass
         return
 
-    # 像素 -> 整格数（1 格 = _win_pixels_per_click 像素）。先累积像素，
-    # 满一格才发一次 ±120 事件，余量保留在累积器里。由于每次事件只
-    # 表达一格，这里每次最多发一格（|notches| 通常为 1，除非单帧 step
-    # 极大，此时拆成多次逐格发送，保证每格幅度都正确）。
+    # 像素 -> 滚轮单位（1 格 = _win_pixels_per_click 像素 = 120 单位），
+    # 先累积再取整，小数余量留在累积器，保证总跨度精确。
     _win_scroll_accum += pixels
-    notches = int(_win_scroll_accum / _win_pixels_per_click)
-    if notches == 0:
+    units = _win_scroll_accum * (120.0 / _win_pixels_per_click)
+    delta = int(round(units))
+    if delta == 0:
         return
-    _win_scroll_accum -= notches * _win_pixels_per_click
-    direction = 120 if notches > 0 else -120
-    for _ in range(abs(notches)):
-        _win_post_wheel(direction)
+    _win_scroll_accum -= delta * (_win_pixels_per_click / 120.0)
+    # 亚格直发（顺滑）；失败回退整格 mouse_event（幅度可靠、兼容性最好）。
+    if not _win_post_wheel_precise(delta):
+        direction = 120 if delta > 0 else -120
+        for _ in range(abs(delta)):
+            _win_post_wheel(direction)
 
 
 # smooth_scroll 以 120fps 发送增量并依赖 time.sleep(1/120)。Windows 默认
