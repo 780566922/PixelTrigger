@@ -157,9 +157,10 @@ DEFAULT_CONFIG = {
     "total_pixels": "325", "duration": "0.65",
     # Windows 专属滚轮调优（macOS 的 CGEvent 是像素级滚动，不使用该项）：
     #   win_scroll_density 滚动密度，1.0 = 每 100 像素 1 格（120）。
-    #                      它是「总距离 → 实际滚动跨度」的放大倍率：
-    #                          实际滚动格数 ≈ 总距离 / 100 × 密度
-    #                      调高＝滚得更远、观感更连续；需相应调小「总距离」。
+    #                      它决定「总距离」被拆成多少格（多少步）：
+    #                          格数 = 总距离 / (100 / 密度)
+    #                      调高＝步数更多、滚动更顺滑，但总跨度不变；
+    #                      「总距离」才严格决定滚动总跨度（两者正交）。
     "win_scroll_density": "1.0",
     "key_combo": "Next", "key_action": "press",
     "key_repeat_count": "3", "key_repeat_interval": "0.5",
@@ -479,16 +480,24 @@ def pick_color_at(gx, gy):
 
 
 def smooth_scroll(total_pixels, duration, direction, stop_event):
-    """把总距离按缓入缓出曲线拆成 120fps 的滚轮增量下发。
+    """把总距离按缓入缓出曲线拆成滚轮事件下发。
+
+    macOS：CGEvent 是像素级滚动，逐帧下发像素量即可连续平滑。
+
+    Windows：滚轮以「格」为标定（WHEEL_DELTA = 120）。本函数按像素
+    缓动逐帧下发像素量，由平台层的 post_scroll **按整格累积**后再发
+    出 120 的整数倍事件——这保证「总距离」严格线性地决定格数，且每格
+    都是标准整格增量，方向与幅度经 mouse_event 正确传递，不再被
+    亚格微增量的 DWORD 截断压平（旧实现的问题根源）。
 
     帧推进使用「绝对时间表」而非逐帧 sleep(interval)：后者会把每次
     sleep 的过量等待累加进来，Windows 下单次误差常有 1~3ms，几十帧下来
-    动画被整体拉长、节奏飘忽，观感就是卡顿。绝对时间表每帧向起点对齐，
-    误差不累积（落后过多时直接跳过补眠，总量由曲线本身保证）。
+    动画被整体拉长、节奏飘忽。绝对时间表每帧向起点对齐，误差不累积。
     """
     def ease(t):
         return 4*t*t*t if t < 0.5 else 1 - pow(-2*t + 2, 3) / 2
     sign = -1 if direction == "up" else 1
+    tp = max(0, int(total_pixels))
     fps = 120
     interval = 1.0 / fps
     total_frames = max(1, int(duration * fps))
@@ -498,7 +507,7 @@ def smooth_scroll(total_pixels, duration, direction, stop_event):
         if stop_event.is_set():
             return
         t = frame / total_frames
-        target = int(total_pixels * ease(t) + 0.5)
+        target = int(tp * ease(t) + 0.5)
         step = target - scrolled
         if step > 0:
             pb.post_scroll(sign * step)
@@ -507,7 +516,7 @@ def smooth_scroll(total_pixels, duration, direction, stop_event):
         if delay > 0:
             time.sleep(delay)
     if not stop_event.is_set():
-        tail = total_pixels - scrolled
+        tail = tp - scrolled
         if tail > 0:
             pb.post_scroll(sign * tail)
 
@@ -1379,8 +1388,10 @@ class PixelTriggerApp:
         f1.pack(side="left")
         ToolTip(e1, "一次翻页的基础跨度（内容像素）。\n"
                     "调大：翻得更远。\n调小：翻得更近。\n"
-                    "Windows 上实际滚动量 = 总距离 / 100 × 滚动密度，\n"
-                    "下方会实时显示换算后的格数。改完立即生效。")
+                    "这个值严格决定实际滚动量，改完立即生效。\n"
+                    "Windows 上会按「滚动密度」把这段距离拆成若干格\n"
+                    "逐格下发（下方实时显示格数），密度只影响顺滑度、\n"
+                    "不影响总跨度。")
         f2, e2 = self._make_field(sr2, "总时长", "duration", width=5)
         f2.pack(side="left", padx=(8, 0))
         ToolTip(e2, "完成一次滚动所用的时间。\n调大：更慢更悠长。\n"
@@ -1395,12 +1406,13 @@ class PixelTriggerApp:
                                       width=4)
             f3.pack(side="left")
             ToolTip(e3,
-                    "Windows 滚轮倍率：1.0 = 每 100 像素 1 格（120）。\n"
-                    "实际滚动格数 ≈ 总距离 / 100 × 密度。\n"
-                    "调高：滚得更远、更连续，相当于把总距离放大，\n"
-                    "         需相应调小「总距离」免得越过目标位置。\n"
-                    "调低：滚得更近、更轻，也更快停下来。\n"
-                    "建议配合「试滚」实测确定。")
+                    "Windows 滚轮粒度：1.0 = 每 100 像素 1 格。\n"
+                    "「总距离」决定滚动总跨度，「密度」只决定它被拆成\n"
+                    "多少格（多少步），两者互不影响。\n"
+                    "调高密度 → 每格更小、步数更多、滚动更顺滑；\n"
+                    "         总跨度不变（仍是「总距离」那么多）。\n"
+                    "调低密度 → 步数更少、更有「一格一格」的顿挫感。\n"
+                    "建议配合「试滚」实测，通常 3~6 顺滑度较好。")
             test_btn = ttk.Button(sr3, text="试滚", width=4,
                                   command=self.test_scroll)
             test_btn.pack(side="left", padx=(8, 0), anchor="s", pady=(0, 1))

@@ -521,19 +521,22 @@ _WIN_DENSITY_MAX = 10.0
 def set_scroll_density(density):
     """设置 Windows 滚动密度。
 
-    密度 = 「单位距离拆成多少滚轮格」的倍率：1.0 为基准（每 100 像素 1 格）。
-    调高密度 → 每格内容更少，同一「总距离」换算出的滚轮格数更多，一次
-    触发落到目标程序里的实际滚动跨度也随之变大：
+    密度 = 「一格对应多少内容像素」的倍率：1.0 为基准（每格 100 像素）。
+    每格像素 = 100 / 密度，因此调高密度 → 每格内容更少 → 同一「总距离」
+    拆出的整格事件更多、滚动更连续（顺滑）。
 
-        实际滚动格数 ≈ 总距离 / 100 × 密度
+    关键语义（v1.2.5 修正）：
+        · 「总距离」决定实际滚动的总跨度，严格线性——改 600 一定比
+          325 滚得远，与密度无关。
+        · 「密度」只决定这份跨度被拆成多少格（多少步）：密度越高、
+          步数越多、越顺滑。两个旋钮**正交**，不再「同向相乘」。
 
-    也就是说「滚动密度」与「总距离」是同向相乘的两个旋钮——调高密度
-    等价于把总距离按同一比例放大，需要相应调小总距离；上限 10.0 时
-    实际滚动量已达基准的 10 倍。
-
-    另需注意：每帧最多下发一次事件，事件数已被帧率封顶（0.65 秒内约
-    60 余次），所以提高密度并不会让事件「更密」，只是让每次事件携带的
-    增量更大、观感更连续。
+    这是对旧实现的纠正：旧版把像素直接乘 (120/每格像素) 换算成滚轮
+    单位，导致「密度调高 = 总滚动量放大」，密度与总距离混淆不清，
+    且亚格微增量（远小于 WHEEL_DELTA=120）经 mouse_event 的 DWORD
+    无符号参数传递后，下游读到的高 16 位只剩方向、幅度被压平，最终
+    「总距离」与「实际滚动量」脱钩（用户实测改大总距离反而滚得更短）。
+    现改为：按整格（120 的整数倍）累积下发，幅度与方向都正确传递。
 
     仅在 Windows 生效；macOS 的 CGEvent 是像素级滚动，无需此换算。
     """
@@ -549,9 +552,10 @@ def set_scroll_density(density):
 
 
 def scroll_notches_for(pixels):
-    """把像素总距离换算成目标程序大致会滚动的「格数」。
+    """把像素总距离换算成目标程序会滚动的「格数」。
 
-    仅用于把「总距离 × 滚动密度」的实际效果在界面上显式化（Windows）。
+    格数 = 总距离 / 每格像素（每格像素由滚动密度决定，见 set_scroll_density）。
+    仅用于把「总距离被拆成多少格」在界面上显式化（Windows）。
     """
     if not IS_WIN:
         return 0.0
@@ -578,12 +582,27 @@ def _win_post_wheel(delta):
 def post_scroll(pixels):
     """发送一次滚轮事件。pixels 为像素量，正值表示向上滚动（内容下移）。
 
-    macOS：CGEvent 像素级滚动，直接下发。
+    macOS：CGEvent 是像素级滚动（kCGScrollEventUnitPixel），任意像素量
+    可直接下发，无「格」的概念。
 
-    Windows：WM_MOUSEWHEEL 接受任意整数增量（不必是 120 的整数倍），
-    逐帧下发亚格增量即可获得连续滚动；旧实现按整格量化（每积累一格
-    才发一次），平滑动画被压缩成 3~4 次大跳变，表现为一顿一顿。
+    Windows：滚轮事件以「格」为标定（WHEEL_DELTA = 120）。WM_MOUSEWHEEL
+    的 wheelDelta 是 wParam 高 16 位的有符号 short，虽然理论上能表达
+    亚格增量，但 mouse_event 的 dwData 参数是 32 位无符号整数，把负的
+    亚格增量（如 -1~-27）传进去后，下游程序用 GET_WHEEL_DELTA_WPARAM
+    读到的高 16 位只剩方向、幅度被压平；再加上相当多程序按「整格截断」
+    （int(delta/120)）处理滚轮，亚格微增量会被直接丢弃。
+
+    因此 Windows 必须**按整格累积下发**：像素量累积满一格（即
+    _win_pixels_per_click 像素）才发一次 ±120 的整格事件。这样
+    「总距离」才与「实际滚动格数」保持严格线性，不会出现「改大总距离
+    反而滚得更短」的脱钩现象。小数余量留在累积器，跨多次触发不漂移。
     换算比例由「滚动密度」控制（见 set_scroll_density）。
+
+    关键约束：mouse_event 的 dwData 虽为 32 位，但系统据此生成的
+    WM_MOUSEWHEEL 的 wheelDelta 是 wParam 高 16 位有符号 short，且语义
+    上按 WHEEL_DELTA(120) 归一。因此**单次调用最多只能可靠表达 ±1 格
+    （±120）**，超过 ±120 的增量（如 ±240）其高位会被压平、幅度丢失。
+    故每次事件固定发 ±120，多格由「发多次」表达，而非「一次发大值」。
     """
     global _win_scroll_accum
     try:
@@ -599,14 +618,18 @@ def post_scroll(pixels):
             pass
         return
 
-    # 像素 -> 滚轮增量（1 格 = _win_pixels_per_click 像素），小数余量
-    # 留在累积器里随后续帧发出，动画总量与设定像素数严格一致。
-    _win_scroll_accum += pixels * (120.0 / _win_pixels_per_click)
-    delta = int(_win_scroll_accum)   # 朝零取整，余量按原符号保留
-    if delta == 0:
+    # 像素 -> 整格数（1 格 = _win_pixels_per_click 像素）。先累积像素，
+    # 满一格才发一次 ±120 事件，余量保留在累积器里。由于每次事件只
+    # 表达一格，这里每次最多发一格（|notches| 通常为 1，除非单帧 step
+    # 极大，此时拆成多次逐格发送，保证每格幅度都正确）。
+    _win_scroll_accum += pixels
+    notches = int(_win_scroll_accum / _win_pixels_per_click)
+    if notches == 0:
         return
-    _win_scroll_accum -= delta
-    _win_post_wheel(delta)
+    _win_scroll_accum -= notches * _win_pixels_per_click
+    direction = 120 if notches > 0 else -120
+    for _ in range(abs(notches)):
+        _win_post_wheel(direction)
 
 
 # smooth_scroll 以 120fps 发送增量并依赖 time.sleep(1/120)。Windows 默认
