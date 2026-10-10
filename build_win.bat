@@ -31,11 +31,13 @@ python -m pip install -q pyinstaller Pillow
 
 echo.
 echo [4/4] Building EXE (may take a few minutes)...
+python gen_version.py
 pyinstaller --noconfirm --clean --onefile --windowed ^
     --name PixelTrigger ^
     --icon icon.ico ^
     --add-data "donation.png;." ^
     --add-data "icon.ico;." ^
+    --add-data "version.txt;." ^
     --hidden-import platform_backend ^
     --hidden-import PIL.ImageGrab ^
     color_watcher.py

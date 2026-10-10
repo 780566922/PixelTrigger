@@ -10,6 +10,9 @@ dist/
 # PyInstaller 自动生成的 spec 文件
 *.spec
 
+# 打包前由 gen_version.py 从 setup.py 导出
+version.txt
+
 # Python 缓存
 __pycache__/
 *.pyc

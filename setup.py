@@ -8,12 +8,13 @@ PixelTrigger — py2app 打包配置
 依赖：pip3 install py2app Pillow pyobjc-framework-Quartz pyobjc-framework-ApplicationServices
 """
 
+import os
 import sys
 from setuptools import setup
 
 APP = ['color_watcher.py']
 
-VERSION = '1.2.3'
+VERSION = '1.2.4'
 
 # pyobjc 框架以 .so 形式提供，必须显式纳入打包范围
 PYOBJC_MODULES = [
@@ -44,6 +45,10 @@ TK_MODULES = [
 DATA_FILES = [
     ('', ['donation.png']),
 ]
+# version.txt 由 gen_version.py 在打包前生成（内容取自本文件的 VERSION），
+# 随产物分发供界面显示版本号。缺失时跳过，保证直接跑 py2app 也能构建。
+if os.path.exists('version.txt'):
+    DATA_FILES.append(('', ['version.txt']))
 
 OPTIONS = {
     # 本应用不接受拖放文件，也不从命令行取参，关闭 argv 模拟可省掉不必要的开销

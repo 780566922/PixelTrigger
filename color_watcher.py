@@ -7,6 +7,7 @@ import os
 import sys
 import json
 import math
+import ast
 import threading
 import queue
 
@@ -87,6 +88,63 @@ def get_app_icon_path():
     return None
 
 
+def get_app_version():
+    """应用版本号字符串（形如 "1.2.4"），用于界面上的版本标识。
+
+    历史上多次出现「用户不确定自己跑的是哪个构建」的问题（例如 v1.2.2
+    与 v1.2.3 界面完全相同），因此把版本号显示出来。
+
+    取值优先级：
+    1. 构建时由 gen_version.py 生成的 version.txt（打包后随产物分发）
+    2. 源码目录下的 setup.py —— setup.py 的 VERSION 是唯一版本源
+    3. 空串（界面不显示版本标识）
+    """
+    candidates = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(os.path.join(meipass, "version.txt"))
+    script_dir = None
+    try:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+    except Exception:
+        pass
+    if getattr(sys, "frozen", False):
+        # py2app：资源位于 Contents/Resources/ 或 Contents/Frameworks/
+        exe_dir = os.path.dirname(sys.executable)
+        candidates.append(os.path.normpath(
+            os.path.join(exe_dir, "..", "Resources", "version.txt")))
+        candidates.append(os.path.normpath(
+            os.path.join(exe_dir, "..", "Frameworks", "version.txt")))
+    if script_dir:
+        candidates.append(os.path.join(script_dir, "version.txt"))
+        candidates.append(os.path.join(script_dir, "setup.py"))
+    for p in candidates:
+        try:
+            if not os.path.exists(p):
+                continue
+            with open(p, encoding="utf-8") as f:
+                text = f.read()
+        except Exception:
+            continue
+        if os.path.basename(p) == "version.txt":
+            v = text.strip()
+        else:
+            # 开发态：解析 setup.py 的 VERSION 字面量（与 build_app.sh 同口径）
+            v = ""
+            try:
+                for node in ast.walk(ast.parse(text)):
+                    if isinstance(node, ast.Assign) and \
+                       getattr(node.targets[0], "id", "") == "VERSION":
+                        v = str(getattr(node.value, "value", "") or "")
+                        break
+            except Exception:
+                v = ""
+            v = v.strip()
+        if v:
+            return v
+    return ""
+
+
 DEFAULT_CONFIG = {
     "x": "1062", "y": "981", "w": "213", "h": "41",
     "br": "30", "bg": "20", "mb": "100", "mc": "5",
@@ -127,6 +185,10 @@ THEME_POLL_MS = 1000
 
 # 日志区保留的最大行数，超出后丢弃最旧的。
 LOG_MAX_LINES = 2000
+
+# 参数回显防抖：停止输入这么久之后，才在日志里回显一次「已生效」的参数。
+# 逐字符打字都回显会刷屏，故只在输入稳定后回显。
+PARAM_ECHO_DELAY_MS = 700
 
 HUE_PRESETS = [
     ("赤", "#FF3B30", (255, 59, 48)),
@@ -717,8 +779,13 @@ class PixelTriggerApp:
         self.key_combo_str = self.cfg_values.get("key_combo", "Next")
 
         self.live = {}
+        # 参数回显（「⚙ 参数已生效」日志）的防抖状态。_param_echo_last 为
+        # None 表示尚在启动阶段、不安排回显，避免一启动就刷一条日志。
+        self._param_echo_job = None
+        self._param_echo_last = None
         self._build_ui()
         self._update_live()
+        self._param_echo_last = self._param_echo_sig()
 
         self._initial_snapshot = self._snapshot_all()
 
@@ -953,6 +1020,14 @@ class PixelTriggerApp:
         tk.Label(left, text="  像素触发器",
                  bg=C_WINDOW_BG, fg=C_SUBTEXT,
                  font=(pb.FONT_UI, 11)).pack(side="left", pady=(6, 0))
+        # 版本标识：用来区分「跑的是哪个构建」，避免再出现
+        # 「修好了但用户跑的仍是旧版」这类来回。
+        self.app_version = get_app_version()
+        if self.app_version:
+            tk.Label(left, text=f"v{self.app_version}",
+                     bg=C_WINDOW_BG, fg=C_GRAY_DISABLED_FG,
+                     font=(pb.FONT_MONO, 9)).pack(side="left", pady=(10, 0),
+                                                   padx=(6, 0))
 
         right = tk.Frame(top, bg=C_WINDOW_BG)
         right.pack(side="right")
@@ -1493,16 +1568,65 @@ class PixelTriggerApp:
         pb.set_scroll_density(self._scroll_density())
 
     def _refresh_scroll_hint(self):
-        """刷新「实际滚动量」提示，把总距离 × 密度的合成结果显示出来。"""
+        """刷新「实际滚动量」提示，把总距离 × 密度的合成结果显示出来。
+
+        取值刻意读**运行时快照** self.live，而不是输入框本身：快照才是
+        监控线程真正会用的值。因此这行文字同时充当「参数是否已生效」的
+        指示灯——它变了，就说明监控确实拿到了新值。
+        """
         var = getattr(self, "scroll_hint_var", None)
         if var is None or not pb.IS_WIN:
             return
         try:
-            tp = float(self.vars["total_pixels"].get())
+            tp = float((getattr(self, "live", None) or {}).get("total_pixels", ""))
         except Exception:
-            var.set("")
+            var.set("编辑中…")
             return
-        var.set(f"≈ {pb.scroll_notches_for(tp):.1f} 格 / 次")
+        var.set(f"生效 ≈ {pb.scroll_notches_for(tp):.1f} 格 / 次")
+
+    # ---------------------------------------------------------- 参数回显
+    def _param_echo_sig(self):
+        """当前「会影响滚动」的参数签名（用于判断是否真的变了）。"""
+        live = getattr(self, "live", None) or {}
+        return (live.get("total_pixels"), live.get("duration"),
+                live.get("win_scroll_density"))
+
+    def _schedule_param_echo(self):
+        """参数变更后安排一次「已生效」日志回显（防抖 700ms）。"""
+        if getattr(self, "_param_echo_last", None) is None:
+            return                      # 启动阶段，不安排
+        job = getattr(self, "_param_echo_job", None)
+        if job is not None:
+            try:
+                self.root.after_cancel(job)
+            except Exception:
+                pass
+        try:
+            self._param_echo_job = self.root.after(
+                PARAM_ECHO_DELAY_MS, self._emit_param_echo)
+        except Exception:
+            self._param_echo_job = None
+
+    def _emit_param_echo(self):
+        """把监控线程当前真正会用的滚动参数回显到日志，确认已生效。
+
+        只在参数真的发生变化时输出一次，避免重复刷屏。
+        """
+        self._param_echo_job = None
+        sig = self._param_echo_sig()
+        if sig == self._param_echo_last:
+            return
+        self._param_echo_last = sig
+        tp, du, _ = sig
+        tail = ""
+        if pb.IS_WIN:
+            try:
+                tail = f" → 约 {pb.scroll_notches_for(float(tp)):.1f} 格 / 次"
+            except Exception:
+                tail = ""
+        head = "⚙ 参数已生效" if self.running else "⚙ 参数已记录"
+        self.log_msg(f"{head}：总距离 {tp or '—'} / 总时长 "
+                     f"{du or '—'} 秒{tail}")
 
     def test_scroll(self):
         """用当前参数试滚一次。
@@ -1602,6 +1726,7 @@ class PixelTriggerApp:
         # 放在这里而不是触发线程里：Tk 变量只能在主线程读写。
         self._apply_scroll_tuning()
         self._refresh_scroll_hint()
+        self._schedule_param_echo()
         self._maybe_adjust_cooldown()
 
     def _maybe_adjust_cooldown(self):

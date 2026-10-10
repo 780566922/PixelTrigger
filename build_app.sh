@@ -106,8 +106,11 @@ PYEOF
 STAGE="$(mktemp -d /tmp/pt-build.XXXXXX)"
 trap 'rm -rf "${STAGE}"' EXIT
 cp "${PROJECT_DIR}/color_watcher.py" "${PROJECT_DIR}/platform_backend.py" \
-   "${PROJECT_DIR}/setup.py" \
+   "${PROJECT_DIR}/setup.py" "${PROJECT_DIR}/gen_version.py" \
    "${PROJECT_DIR}/donation.png" "${PROJECT_DIR}/icon.icns" "${STAGE}/"
+
+echo "==> 生成 version.txt（供界面显示版本号）"
+"${VENV_DIR}/bin/python" "${STAGE}/gen_version.py"
 
 echo "==> 运行 py2app（构建目录 ${STAGE}）"
 cd "${STAGE}"
