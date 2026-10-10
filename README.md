@@ -19,7 +19,7 @@
 
 ### macOS
 
-1. 从 Releases 页面下载最新的 `PixelTrigger-1.2.1.dmg`（或 `PixelTrigger.app.zip`）
+1. 从 Releases 页面下载最新的 `PixelTrigger-1.2.2.dmg`（或 `PixelTrigger.app.zip`）
 2. 打开 DMG，把 PixelTrigger 拖到「应用程序」文件夹；或解压 zip 后手动拖入
 3. 第一次打开：右键点击 App，选择「打开」，弹窗里再点「打开」
 4. 授权：
@@ -58,6 +58,34 @@
 > 区域保持一致（v1.2.1 修复：旧版在缩放屏幕上框选会偏移）。
 > 若遇到坐标异常，可在源码目录运行 `python dpi_diag.py --grab`
 > 输出各坐标源的诊断信息，便于反馈定位。
+
+### Windows 滚动卡顿怎么调
+
+Windows 的滚轮事件以「格」为单位（一格 = `WHEEL_DELTA` = 120），
+不同程序对「不足一格」的增量处理差异很大，因此滚动是否顺滑**取决于
+目标程序**：浏览器、Office、新版 Qt 程序接受细粒度增量，滚动可以很
+连续；另有一些程序会按整数格截断，或自带滚动动画被高频小事件反复
+打断，就会表现为一顿一顿。
+
+v1.2.2 起，「滚动翻页」面板在 Windows 上多出三个控件（macOS 不显示，
+因为 macOS 的 CGEvent 是像素级滚动，没有格的概念）：
+
+| 控件 | 说明 |
+|---|---|
+| **滚动密度** | 1.0 = 每 100 像素 1 格。整格模式下直接决定「总距离」会被拆成多少次滚动：调高 → 格更多更小、事件更密（但总滚动量变大，需相应调小「总距离」）。 |
+| **整格** | 勾选后只发送 120 的整数倍增量，供对细小增量无响应、或自带滚动动画被打断的程序使用。 |
+| **试滚** | 用当前参数立即滚动一次，不必等颜色触发即可反复对照调参。 |
+
+调参建议：
+
+1. 先点「试滚」，观察目标程序的反应；
+2. 默认「细粒度 + 密度 1.0」已是最顺滑的档位（事件数在上限约 98 次/秒）；
+   若目标程序**完全不响应或一顿一顿**，勾选「整格」；
+3. 勾了「整格」后滚动会变成明显的阶梯感，此时**调高滚动密度**即可把
+   同一距离拆成更多次小格事件（例如密度 4.0 → 约 13 次/0.65 秒），
+   待观感连续后，再把「总距离」调回实际需要的跨度；
+4. 若目标程序本身自带滚动动画（部分乐谱 / 阅读软件），把密度**调低**
+   反而可能更稳。
 
 > 该 exe 由 GitHub Actions 在云端 Windows 环境自动构建（`PyInstaller` 不支持
 > 交叉编译，Windows 程序只能在 Windows 上打包），配置见
@@ -118,7 +146,7 @@ python color_watcher.py
 
 ```bash
 ./build_app.sh               # 生成 dist/PixelTrigger.app
-./build_app.sh --dmg         # 同时生成 dist/PixelTrigger-1.2.0.dmg
+./build_app.sh --dmg         # 同时生成 dist/PixelTrigger-1.2.2.dmg
 ```
 
 脚本会自动完成：创建隔离的构建虚拟环境、安装依赖、应用 py2app 兼容补丁、
@@ -166,7 +194,7 @@ build_win.bat
 
 | 能力 | macOS | Windows |
 |---|---|---|
-| 屏幕截图 | Quartz.CGWindowListCreateImage | PIL.ImageGrab |
+| 屏幕截图 | Quartz.CGWindowListCreateImage | GDI BitBlt（ctypes），ImageGrab 兜底 |
 | 滚轮 / 键盘 | CGEvent | mouse_event / keybd_event |
 | 显示器枚举 | CGGetActiveDisplayList | EnumDisplayMonitors |
 | 系统深浅色 | CFPreferences | 注册表 AppsUseLightTheme |

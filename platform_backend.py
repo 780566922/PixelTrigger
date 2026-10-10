@@ -13,7 +13,8 @@ macOS 与 Windows。
   能力            macOS                          Windows
   ------------    ---------------------------    ----------------------------------
   截图            Quartz.CGWindowListCreateImage GDI BitBlt (ctypes)
-  滚轮            CGEvent 像素级                  mouse_event 细粒度增量（120=1格）
+  滚轮            CGEvent 像素级                  mouse_event 细粒度/整格增量
+                                                  （120 = 1 格，密度可调）
   键盘            CGEvent + 虚拟键码              keybd_event + VK 码
   显示器枚举      CGGetActiveDisplayList          EnumDisplayMonitors
   DPI 感知        系统原生（Retina 由 CG 处理）   进程级声明 Per-Monitor v2
@@ -491,24 +492,94 @@ def _mac_grab(x, y, w, h):
 # ============================================================
 
 # macOS 是像素级滚动；Windows 的滚轮事件以「格」为标定（一格 = 120）。
-# 1 格按 100 内容像素标定（与浏览器默认单格滚动量一致）。
-# 用累积器换算并保留小数余量，保证动画总量精确、无系统性偏差。
-_WIN_PIXELS_PER_CLICK = 100.0
+# 基准换算：1 格按 100 内容像素标定（与浏览器默认单格滚动量一致）。
+# 该比例在运行期由「滚动密度」缩放，见 set_scroll_density()。
+_WIN_BASE_PIXELS_PER_CLICK = 100.0
+
+# ---- 运行期可调参数（主程序在配置变更时写入）----
+# 每格对应的内容像素数：越小，同样的总距离被拆成越多滚轮格。
+_win_pixels_per_click = _WIN_BASE_PIXELS_PER_CLICK
+# 是否使用「整格」模式（只发 120 的整数倍增量）
+_win_scroll_quantize = False
+# 像素换算的累积器，保留小数余量
 _win_scroll_accum = 0.0
+
+# 密度取值范围。下限 0.2 对应每格 500px，再低动画会被压成一两次大跳变；
+# 上限 10 对应每格 10px，格数多到目标程序来不及响应，且总滚动量严重超标。
+_WIN_DENSITY_MIN = 0.2
+_WIN_DENSITY_MAX = 10.0
+
+
+def set_scroll_density(density):
+    """设置 Windows 滚动密度。
+
+    密度 = 「每格对应多少内容像素」的倍率：1.0 为基准（每 100 像素 1 格）。
+    调高密度 → 每格内容更少，同一「总距离」换算出的滚轮格数更多。
+
+    对两类模式的作用不同：
+      * 整格模式（set_scroll_quantize(True)）：格数即事件数，提高密度
+        就是直接提高滚动事件的密度，这是「把滚动调密」的可用杠杆。
+      * 细粒度模式（默认）：每帧最多发一次事件，事件数已被帧率封顶
+        （0.65 秒内约 60 余次），提高密度只增大总滚动量，不再增加事件数。
+
+    上限 10.0（每格 10px）时总滚动量已是基准的 10 倍，需相应调小「总距离」。
+
+    仅在 Windows 生效；macOS 的 CGEvent 是像素级滚动，无需此换算。
+    """
+    global _win_pixels_per_click
+    try:
+        d = float(density)
+    except (TypeError, ValueError):
+        return
+    if d != d or d <= 0:            # NaN / 非正数，忽略
+        return
+    d = min(_WIN_DENSITY_MAX, max(_WIN_DENSITY_MIN, d))
+    _win_pixels_per_click = _WIN_BASE_PIXELS_PER_CLICK / d
+
+
+def set_scroll_quantize(enabled):
+    """切换 Windows 是否使用「整格」滚动模式。
+
+    False（默认）：每帧发送亚格（<120）的细粒度增量，现代程序
+    （浏览器、Qt 5.12+/Qt6、Office 等）据此可获得连续顺滑的滚动。
+
+    True：只发送 120 的整数倍增量。少数程序按「delta / 120 整数除法」
+    处理滚轮，对亚格增量直接丢弃；另有一类程序自带滚动动画，高频小事件
+    会不断打断上一段动画而表现为卡顿——这两类目标需要整格模式。
+
+    切换时清空累积余量，避免两种模式的余量互相串味。
+    """
+    global _win_scroll_quantize, _win_scroll_accum
+    q = bool(enabled)
+    if q != _win_scroll_quantize:
+        _win_scroll_accum = 0.0
+    _win_scroll_quantize = q
+
+
+def _win_post_wheel(delta):
+    """把一次滚轮增量交给系统（delta 为 120 的整数倍，可为负）。"""
+    if not delta:
+        return
+    try:
+        import ctypes
+        MOUSEEVENTF_WHEEL = 0x0800
+        ctypes.windll.user32.mouse_event(
+            MOUSEEVENTF_WHEEL, 0, 0, int(delta), 0)
+    except Exception:
+        pass
 
 
 def post_scroll(pixels):
     """发送一次滚轮事件。pixels 为像素量，正值表示向上滚动（内容下移）。
 
-    Windows 的 WM_MOUSEWHEEL 接受任意整数增量（不必是 120 的倍数）：
-    按帧发送细粒度增量即可获得连续顺滑的滚动。旧实现按整格量化
-    （每积累 100px 才发一格），平滑动画被压缩成 3~4 次大跳变，
-    表现为一顿一顿（v1.2.1 的问题）。
+    macOS：CGEvent 像素级滚动，直接下发。
 
-    兼容性说明：极少数按「delta/120 整数除法、逐事件截断」处理的老
-    程序会对小于一格的增量无响应；现代程序（浏览器、Qt 5.12+/Qt6、
-    Office 等）均支持高精度增量。若目标程序出现「完全不滚动」，可
-    回退整格量化模式（见 _win_legacy_notch_scroll）。
+    Windows：WM_MOUSEWHEEL 接受任意整数增量（不必是 120 的倍数），
+    「细粒度」模式按帧下发亚格增量即可获得连续滚动；旧实现按整格量化
+    （每积累一格才发一次），平滑动画被压缩成 3~4 次大跳变，表现为
+    一顿一顿。目标程序对亚格增量无响应时，切到「整格」模式
+    （set_scroll_quantize(True)）：此时可配合较低的每格像素数
+    （即较高的滚动密度）把同一总距离拆成多次小格事件。
     """
     global _win_scroll_accum
     try:
@@ -524,39 +595,38 @@ def post_scroll(pixels):
             pass
         return
 
-    # 像素 -> 滚轮增量（1 格 = _WIN_PIXELS_PER_CLICK 像素），小数余量
+    if _win_scroll_quantize:
+        _win_quantized_scroll(pixels)
+        return
+
+    # 像素 -> 滚轮增量（1 格 = _win_pixels_per_click 像素），小数余量
     # 留在累积器里随后续帧发出，动画总量与设定像素数严格一致。
-    _win_scroll_accum += pixels * (120.0 / _WIN_PIXELS_PER_CLICK)
+    _win_scroll_accum += pixels * (120.0 / _win_pixels_per_click)
     delta = int(_win_scroll_accum)   # 朝零取整，余量按原符号保留
     if delta == 0:
         return
     _win_scroll_accum -= delta
-    try:
-        import ctypes
-        MOUSEEVENTF_WHEEL = 0x0800
-        ctypes.windll.user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta, 0)
-    except Exception:
-        pass
+    _win_post_wheel(delta)
 
 
-def _win_legacy_notch_scroll(pixels):
-    """整格量化滚动（兼容模式）：每积累 100px 发一格。
+def _win_quantized_scroll(pixels):
+    """整格量化滚动（兼容模式）：每积累一格的像素就发一次整格事件。
 
-    仅供目标程序对细粒度增量无响应时手动替换使用。
+    仅供目标程序对细粒度增量无响应、或自带滚动动画会被高频小事件
+    打断时使用（见 set_scroll_quantize）。配合滚动密度使用，即可把
+    同一总距离拆成「多次小格」，比默认 3~4 次大跳变连续得多。
     """
     global _win_scroll_accum
     _win_scroll_accum += pixels
-    clicks = int(_win_scroll_accum / _WIN_PIXELS_PER_CLICK)
+    clicks = int(_win_scroll_accum / _win_pixels_per_click)
     if clicks == 0:
         return
-    _win_scroll_accum -= clicks * _WIN_PIXELS_PER_CLICK
-    try:
-        import ctypes
-        MOUSEEVENTF_WHEEL = 0x0800
-        ctypes.windll.user32.mouse_event(
-            MOUSEEVENTF_WHEEL, 0, 0, int(clicks * 120), 0)
-    except Exception:
-        pass
+    _win_scroll_accum -= clicks * _win_pixels_per_click
+    _win_post_wheel(clicks * 120)
+
+
+# 旧名保留，避免外部脚本或历史文档引用失效
+_win_legacy_notch_scroll = _win_quantized_scroll
 
 
 # smooth_scroll 以 120fps 发送增量并依赖 time.sleep(1/120)。Windows 默认

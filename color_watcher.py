@@ -97,6 +97,15 @@ DEFAULT_CONFIG = {
     "precise_tol": "30",
     "trigger_mode": "scroll", "scroll_dir": "up",
     "total_pixels": "325", "duration": "0.65",
+    # Windows 专属滚轮调优（macOS 的 CGEvent 是像素级滚动，不使用这两项）：
+    #   win_scroll_density  滚动密度，1.0 = 每 100 像素 1 格（120）。决定
+    #                       同一「总距离」换算成多少滚轮格；整格模式下
+    #                       格数即事件数，故调高密度＝滚动更密（但总滚动
+    #                       量同步变大，需调小「总距离」）。
+    #   win_scroll_quantize 整格模式（"1" 开启）：只发送 120 的整数倍
+    #                       增量，供对亚格增量无响应、或自带滚动动画会
+    #                       被高频小事件打断的目标程序使用。
+    "win_scroll_density": "1.0", "win_scroll_quantize": "0",
     "key_combo": "Next", "key_action": "press",
     "key_repeat_count": "3", "key_repeat_interval": "0.5",
     "key_hold_duration": "1.0",
@@ -411,6 +420,13 @@ def pick_color_at(gx, gy):
 
 
 def smooth_scroll(total_pixels, duration, direction, stop_event):
+    """把总距离按缓入缓出曲线拆成 120fps 的滚轮增量下发。
+
+    帧推进使用「绝对时间表」而非逐帧 sleep(interval)：后者会把每次
+    sleep 的过量等待累加进来，Windows 下单次误差常有 1~3ms，几十帧下来
+    动画被整体拉长、节奏飘忽，观感就是卡顿。绝对时间表每帧向起点对齐，
+    误差不累积（落后过多时直接跳过补眠，总量由曲线本身保证）。
+    """
     def ease(t):
         return 4*t*t*t if t < 0.5 else 1 - pow(-2*t + 2, 3) / 2
     sign = -1 if direction == "up" else 1
@@ -418,6 +434,7 @@ def smooth_scroll(total_pixels, duration, direction, stop_event):
     interval = 1.0 / fps
     total_frames = max(1, int(duration * fps))
     scrolled = 0
+    start = time.perf_counter()
     for frame in range(1, total_frames + 1):
         if stop_event.is_set():
             return
@@ -427,7 +444,9 @@ def smooth_scroll(total_pixels, duration, direction, stop_event):
         if step > 0:
             pb.post_scroll(sign * step)
             scrolled = target
-        time.sleep(interval)
+        delay = start + frame * interval - time.perf_counter()
+        if delay > 0:
+            time.sleep(delay)
     if not stop_event.is_set():
         tail = total_pixels - scrolled
         if tail > 0:
@@ -789,7 +808,7 @@ class PixelTriggerApp:
         "sample_step", "hue_r", "hue_g", "hue_b", "hue_tol",
         "precise_r", "precise_g", "precise_b", "precise_tol",
         "total_pixels", "duration", "key_repeat_count",
-        "key_repeat_interval", "key_hold_duration",
+        "key_repeat_interval", "key_hold_duration", "win_scroll_density",
     }
 
     def load_config(self):
@@ -1287,6 +1306,49 @@ class PixelTriggerApp:
         f2.pack(side="left", padx=(8, 0))
         ToolTip(e2, "完成一次滚动所用的时间。\n调大：更慢更悠长。\n调小：更快更干脆。")
 
+        # 滚轮调优只对 Windows 有意义：macOS 走 CGEvent 像素级滚动，
+        # 没有「格」的概念，故整行只在 Windows 上创建。
+        if pb.IS_WIN:
+            sr3 = tk.Frame(self.scroll_panel, bg=C_CARD_BG)
+            sr3.pack(fill="x", pady=(6, 0))
+            f3, e3 = self._make_field(sr3, "滚动密度", "win_scroll_density",
+                                      width=4)
+            f3.pack(side="left")
+            ToolTip(e3,
+                    "Windows 滚轮粒度：1.0 = 每 100 像素 1 格。\n"
+                    "· 整格模式下：密度直接决定「总距离」被拆成多少\n"
+                    "   次滚动。调高 → 格更多更小、事件更密、滚动更连\n"
+                    "   续；但目标程序总滚动量会变大，需调小「总距离」。\n"
+                    "· 细粒度模式（默认）下事件已达每帧一次的上限，\n"
+                    "   密度只改变总滚动量，不再增加事件数。\n"
+                    "调低则格更少更大、总滚动量更小；若目标程序自带\n"
+                    "滚动动画（如乐谱软件），调低反而可能更稳。\n"
+                    "建议配合「试滚」实测确定。")
+            # 输入即生效：密度改动直接同步到平台层，不必等触发或重启。
+            self.vars["win_scroll_density"].trace_add(
+                "write", lambda *a: self._apply_scroll_tuning())
+            v_q = tk.StringVar(
+                value=self.cfg_values.get("win_scroll_quantize", "0"))
+            self.vars["win_scroll_quantize"] = v_q
+            cb = tk.Checkbutton(sr3, text="整格", variable=v_q,
+                                onvalue="1", offvalue="0",
+                                bg=C_CARD_BG, fg=C_TITLE,
+                                activebackground=C_CARD_BG,
+                                selectcolor=C_PREVIEW_BG,
+                                font=(pb.FONT_UI, 10),
+                                command=self._on_win_scroll_option)
+            cb.pack(side="left", padx=(8, 0), anchor="s", pady=(0, 3))
+            ToolTip(cb,
+                    "只发送 120 的整数倍滚轮增量。\n"
+                    "关闭（默认）：发细粒度增量，浏览器 / Office / \n"
+                    "         新版 Qt 程序最顺滑。\n"
+                    "开启：目标程序对细小增量无响应、或一顿一顿时\n"
+                    "         试试，通常要配合调高滚动密度。")
+            test_btn = ttk.Button(sr3, text="试滚", width=4,
+                                  command=self.test_scroll)
+            test_btn.pack(side="left", padx=(8, 0), anchor="s", pady=(0, 1))
+            ToolTip(test_btn, "用当前参数立即滚动一次，方便对照调参。")
+
         self.key_panel = tk.Frame(b, bg=C_CARD_BG)
         kr1 = tk.Frame(self.key_panel, bg=C_CARD_BG)
         kr1.pack(fill="x", pady=(8, 4))
@@ -1418,6 +1480,67 @@ class PixelTriggerApp:
             self._on_key_action_change()
         self._update_live()
 
+    # ---- Windows 滚轮调优 ----
+    # 这两个参数直接写进平台层的换算器，因此改动后立即生效，
+    # 不需要重新「开始监控」。所有读写都在主线程，不触碰 Tk 的线程约束。
+
+    def _scroll_density(self):
+        # 输入框在编辑过程中会短暂出现空串 / "1." 这类无法解析的中间态，
+        # 此时沿用上一次有效值，避免读数被瞬间打回默认值。
+        try:
+            d = float(self.vars["win_scroll_density"].get())
+            if d != d or d <= 0:
+                raise ValueError
+        except Exception:
+            d = getattr(self, "_last_density", 1.0)
+        d = min(10.0, max(0.2, d))
+        self._last_density = d
+        return d
+
+    def _scroll_quantize(self):
+        try:
+            return str(self.vars["win_scroll_quantize"].get()) == "1"
+        except Exception:
+            return False
+
+    def _apply_scroll_tuning(self):
+        """把「滚动密度 / 整格模式」同步到平台层（仅 Windows 有实际作用）。"""
+        if not pb.IS_WIN:
+            return
+        pb.set_scroll_density(self._scroll_density())
+        pb.set_scroll_quantize(self._scroll_quantize())
+
+    def _on_win_scroll_option(self):
+        self._update_live()
+
+    def test_scroll(self):
+        """用当前参数试滚一次。
+
+        Windows 上滚轮手感高度依赖目标程序（是否接受亚格增量、是否
+        自带滚动动画），参数只能实测确定。此按钮让用户不必等颜色触发
+        即可反复对照调整「滚动密度 / 整格模式」。
+        """
+        try:
+            tp = int(float(self.vars["total_pixels"].get()))
+        except Exception:
+            tp = 325
+        try:
+            dur = float(self.vars["duration"].get())
+        except Exception:
+            dur = 0.65
+        tp = max(1, min(20000, tp))
+        dur = max(0.02, min(10.0, dur))
+        self._apply_scroll_tuning()
+        direction = self.scroll_dir.get()
+        self.log_msg(
+            f"🧪 试滚：{'向上' if direction == 'up' else '向下'} "
+            f"{tp} 像素 / {dur:g} 秒（密度 {self._scroll_density():g}，"
+            f"{'整格' if self._scroll_quantize() else '细粒度'}）")
+        self.scroll_stop_event.clear()
+        threading.Thread(target=smooth_scroll,
+                         args=(tp, dur, direction, self.scroll_stop_event),
+                         daemon=True).start()
+
     def _on_key_action_change(self):
         a = self.key_action.get()
         if a == "repeat":
@@ -1464,7 +1587,8 @@ class PixelTriggerApp:
                        "total_pixels", "duration", "br", "bg", "mb",
                        "precise_r", "precise_g", "precise_b",
                        "key_repeat_count", "key_repeat_interval",
-                       "key_hold_duration"):
+                       "key_hold_duration",
+                       "win_scroll_density", "win_scroll_quantize"):
                 if k in self.vars:
                     live[k] = self.vars[k].get()
             try:
@@ -1481,6 +1605,9 @@ class PixelTriggerApp:
             self.live = live
         except Exception:
             pass
+        # 滚轮调优参数写进平台层换算器（仅 Windows 生效）。
+        # 放在这里而不是触发线程里：Tk 变量只能在主线程读写。
+        self._apply_scroll_tuning()
         self._maybe_adjust_cooldown()
 
     def _maybe_adjust_cooldown(self):
