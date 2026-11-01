@@ -26,7 +26,7 @@
 
 ### macOS
 
-1. 从 Releases 页面下载最新的 `PixelTrigger-1.3.1.dmg`（或 `PixelTrigger.app.zip`）
+1. 从 Releases 页面下载最新的 `PixelTrigger-1.3.2.dmg`（或 `PixelTrigger.app.zip`）
 2. 打开 DMG，把 PixelTrigger 拖到「应用程序」文件夹；或解压 zip 后手动拖入
 3. 第一次打开：右键点击 App，选择「打开」，弹窗里再点「打开」
 4. 授权：
@@ -48,10 +48,23 @@
 > （重复挂载会变成 `/Volumes/PixelTrigger 1` 等），系统无法给它稳定记录权限授权。
 > 请把 App 拖到「应用程序」文件夹，再从那里打开。
 
-> **更新应用后权限可能失效**：本应用使用 ad-hoc 签名（无开发者证书），每次更新后
-> 二进制签名会变化，macOS 会把旧的辅助功能/屏幕录制授权视为「不再匹配」，
-> 表现为系统设置里仍显示已勾选、但应用右上角红点不变绿。
-> 解决办法：在系统设置里**取消勾选 → 重新勾选**一次即可（无需卸载）。
+> **更新应用后，权限还要重新授权吗？**
+> **v1.3.2 起不需要了。** 此前的构建使用 ad-hoc 签名，它的签名身份（designated
+> requirement）是 `cdhash H"..."`，**与二进制内容绑定**——每次重新构建都会变，
+> 于是 macOS 认为"应用被替换了"：系统设置里条目还在、开关也开着，但就是不生效，
+> 必须在设置里删掉条目再重新授权（每次更新都要来一遍）。
+> 现在改用**固定的本机自签名证书**签名，签名身份变成
+> `identifier "com.pixeltrigger.app" and certificate root = H"<证书>"`，
+> 与内容无关，覆盖安装后 macOS 认得出"还是同一个应用"，屏幕录制 / 辅助功能的
+> 授权会**自动继承**。
+>
+> ⚠️ 从旧版本（ad-hoc）升级到 v1.3.2 的**这一次**仍需重新授权一次（签名身份变了）。
+> 如果系统设置里残留着旧条目（显示已勾选却不生效），用下面两条命令清掉最省事：
+> ```bash
+> tccutil reset ScreenCapture com.pixeltrigger.app
+> tccutil reset Accessibility com.pixeltrigger.app
+> ```
+> 然后重新打开应用，按提示授权一次。此后升级不再需要。
 
 ### Windows
 
@@ -107,9 +120,15 @@ macOS 的 `CGEvent` 是像素级滚动。两者的关键差异在于：
 > 2. 停止输入约 0.7 秒后，日志区会出现一条
 >    **`⚙ 参数已生效：总距离 … / 总时长 … 秒 → 约 … 格 / 次`**。
 >
-> 窗口左上角标题旁显示 **`v1.3.1`** 这类版本号，可用来确认自己跑的是
+> 窗口左上角标题旁显示 **`v1.3.2`** 这类版本号，可用来确认自己跑的是
 > 哪个构建（历史上有过一次「以为测的是新版、其实还是旧版」的来回）。
 
+> **v1.3.2 修复：更新后权限不再丢失**
+> 改用**固定的本机自签名证书**签名（由 `setup_signing_cert.sh` 生成，存放于
+> `~/.pixeltrigger-signing/`，10 年有效）。签名身份从「与内容绑定的 CDHash」
+> 变成「bundle id + 证书根」，因此覆盖安装后 macOS 认为仍是同一个应用，
+> 屏幕录制 / 辅助功能授权可以直接继承——不需要再删条目、再重新授权。
+>
 > **v1.3.1 修复**：
 > 1. **「按住拖拽框选后，屏幕一直卡在半透明遮罩上退不出去」**。遮罩是
 >    override-redirect + 半透明 + 置顶的窗口，在 `<ButtonRelease>` 回调里直接
@@ -232,12 +251,20 @@ python color_watcher.py
 推荐使用仓库内置的一键打包脚本：
 
 ```bash
+./setup_signing_cert.sh      # 首次：生成并导入本机代码签名证书（一次即可）
 ./build_app.sh               # 生成 dist/PixelTrigger.app
-./build_app.sh --dmg         # 同时生成 dist/PixelTrigger-1.3.1.dmg
+./build_app.sh --dmg         # 同时生成 dist/PixelTrigger-1.3.2.dmg
 ```
 
 脚本会自动完成：创建隔离的构建虚拟环境、安装依赖、应用 py2app 兼容补丁、
-打包、补 stdlib 锚点、运行时自举验证、ad-hoc 签名。
+打包、补 stdlib 锚点、运行时自举验证、**用固定证书签名**（找不到证书时回退
+ad-hoc 并打印告警，构建不会失败）。
+
+> **为什么必须用固定证书签名**：ad-hoc 签名的 designated requirement 是
+> `cdhash H"..."`，与二进制内容绑定；每次重建 CDHash 都变，macOS 的 TCC
+> 就会认为"应用被替换"，屏幕录制/辅助功能授权随之失效（条目还在却不生效）。
+> 换成固定证书后 DR 变成 `identifier + certificate root`，与内容无关，
+> 覆盖安装即可继承授权。构建结束时脚本会打印本次的 DR，可据此确认。
 
 > **不要用 `/usr/bin/python3` 打包。** CommandLineTools 自带的 Python 3.9 的
 > Tcl/Tk 与 macOS 15.7 不兼容，py2app 探测 Tk 版本时会直接崩溃。脚本使用的是
@@ -251,7 +278,9 @@ python3.12 -m venv .build/venv
     pyobjc-framework-Quartz pyobjc-framework-ApplicationServices
 .build/venv/bin/python setup.py py2app
 ln -sfn ../Resources/lib dist/PixelTrigger.app/Contents/MacOS/lib
-codesign --force --deep --sign - dist/PixelTrigger.app
+codesign --force --deep --sign "PixelTrigger Local Signing" dist/PixelTrigger.app
+# 尚未创建证书时可临时用 ad-hoc（代价：下次更新权限需重新授权）
+# codesign --force --deep --sign - dist/PixelTrigger.app
 ```
 
 产物在 `dist/PixelTrigger.app`。

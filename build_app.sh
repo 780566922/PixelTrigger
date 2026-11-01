@@ -160,9 +160,34 @@ PYEOF
 
 # 验证已通过，最后再签名：签名动作必须收尾，否则任何一次字节码写入
 # 都会让 resource seal 失效。
-echo "==> 签名（ad-hoc）"
-codesign --force --deep --sign - "${APP}" 2>/dev/null
+#
+# ---------------------------------------------------------------- 为什么不用 ad-hoc
+# ad-hoc 签名的 designated requirement 是 `cdhash H"..."`，也就是与**内容**
+# 绑定：每次重新构建 CDHash 都变。macOS 的 TCC（屏幕录制 / 辅助功能）把
+# 这条 requirement 存进授权记录，新版本一装上就"对不上号"，于是出现
+#   「更新后权限条目还在，但开关打开了却不生效，
+#     必须去系统设置里把条目删掉再重新授权」
+# 的死循环（每次更新都要来一遍）。
+#
+# 换成固定证书签名后，DR 变成
+#   identifier "com.pixeltrigger.app" and certificate root = H"<证书>"
+# 与内容无关，所以覆盖安装后 TCC 能认出"还是同一个应用"，授权正常继承。
+# 证书由 setup_signing_cert.sh 生成并导入登录钥匙串（自签名，本机用）。
+# 没有证书时自动回退 ad-hoc 并明确告警，绝不因此让构建失败。
+SIGN_ID="${PIXELTRIGGER_SIGN_ID:-PixelTrigger Local Signing}"
+if security find-identity -v -p codesigning 2>/dev/null | grep -qF "${SIGN_ID}"; then
+  echo "==> 签名（${SIGN_ID}）"
+  codesign --force --deep --sign "${SIGN_ID}" "${APP}"
+else
+  echo "==> 签名（ad-hoc）"
+  echo "    ⚠️ 未找到代码签名身份「${SIGN_ID}」，已回退 ad-hoc。"
+  echo "       代价：本次构建的 CDHash 与上次不同，macOS 会认为应用被替换，"
+  echo "       屏幕录制/辅助功能需要在系统设置里删掉旧条目后重新授权。"
+  echo "       一劳永逸的办法：先跑 ./setup_signing_cert.sh，再重新构建。"
+  codesign --force --deep --sign - "${APP}"
+fi
 codesign --verify --deep --strict "${APP}" && echo "    [OK] 代码签名校验通过"
+echo "    DR: $(codesign -d -r- "${APP}" 2>&1 | grep designated | sed 's/^designated => //')"
 
 SIZE="$(du -sh "${APP}" | cut -f1)"
 echo ""
