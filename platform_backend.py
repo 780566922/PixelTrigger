@@ -986,3 +986,53 @@ def register_global_hotkey(callback, keycode=36,
         return True
     except Exception:
         return False
+
+
+# ============================================================
+# 物理鼠标状态 / 位置（框选遮罩的「松手事件丢失」兜底）
+#
+# Tk 的 <ButtonRelease> 在 override-redirect + 半透明覆盖层上偶发丢失
+# （快速拖拽尤其明显），一旦丢了，遮罩就再也没有事件能够关掉它。
+# 这里直接问操作系统「左键还按着吗」，让上层可以自己补一刀。
+# 未知平台一律返回 True（= 一直按着），避免误触发兜底逻辑。
+# ============================================================
+
+def mouse_left_down():
+    """物理左键当前是否处于按下状态。拿不到信息时返回 True。"""
+    if IS_MAC and Quartz is not None:
+        try:
+            return bool(Quartz.CGEventSourceButtonState(
+                Quartz.kCGEventSourceStateCombinedSessionState, 0))
+        except Exception:
+            return True
+    if IS_WIN:
+        try:
+            import ctypes
+            return bool(ctypes.windll.user32.GetAsyncKeyState(0x01) & 0x8000)
+        except Exception:
+            return True
+    return True
+
+
+def mouse_position():
+    """全局鼠标坐标（与 list_displays 同一坐标空间）。失败返回 None。"""
+    if IS_MAC and Quartz is not None:
+        try:
+            evt = Quartz.CGEventCreate(None)
+            p = Quartz.CGEventGetLocation(evt)
+            return (int(p.x), int(p.y))
+        except Exception:
+            return None
+    if IS_WIN:
+        try:
+            import ctypes
+
+            class _PT(ctypes.Structure):
+                _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+            pt = _PT()
+            if ctypes.windll.user32.GetCursorPos(ctypes.byref(pt)):
+                return (int(pt.x), int(pt.y))
+        except Exception:
+            return None
+    return None

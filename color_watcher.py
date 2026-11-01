@@ -2718,13 +2718,30 @@ class PixelTriggerApp:
         pb.open_ax_settings_page()
 
     def select_region(self):
+        """全屏遮罩上框选监控区域。
+
+        两种操作方式都支持：按住拖拽出矩形，或点两次（左上 → 右下）。
+
+        关于「拖拽结束后遮罩不消失」的修复（v1.3.1）：
+        遮罩是 override-redirect + 半透明 + topmost 的 Toplevel。macOS 上在
+        `<ButtonRelease-1>` 回调里直接 `destroy()` 这套属性的窗口，Tk 有概率
+        只把 Tcl 对象拆掉、NSWindow 仍留在屏幕上 —— 结果是区域已经填好、程序
+        也在正常跑，桌面上却盖着一层点不动的黑纱。两次点击之所以"正常"，只是
+        因为松手前没有那一长串 Motion 事件把窗口系统状态搅乱的概率低一些。
+        因此这里改成三步：**先 withdraw（同步 unmap，屏幕立刻恢复）→ 记录结果
+        并唤醒等待方 → after_idle 再真正 destroy**，任何一步失败都不影响退出。
+        另外加一路兜底轮询：万一 <ButtonRelease> 本身丢了，靠「物理左键已松开」
+        自己补一次松手，绝不让遮罩把用户困住。
+        """
         result = {"x": None, "y": None, "w": None, "h": None}
         screens = pb.list_displays()
         if not screens:
             self.log_msg("⚠️ 无法获取显示器列表")
             return
         overlays, canvas_info = [], []
-        st = {"down": False, "dx": 0, "dy": 0, "fx": None, "fy": None, "moved": False}
+        done_var = tk.BooleanVar(master=self.root, value=False)
+        st = {"down": False, "dx": 0, "dy": 0, "fx": None, "fy": None,
+              "moved": False, "done": False, "last": None, "poll": None}
 
         def cross(gx, gy):
             for c, s in canvas_info:
@@ -2764,16 +2781,93 @@ class PixelTriggerApp:
                     c.itemconfig(c._d, state="hidden")
 
         def destroy():
+            if st["done"]:
+                return
+            st["done"] = True
             self._overlay_open = False
+            if st["poll"] is not None:
+                try:
+                    self.root.after_cancel(st["poll"])
+                except Exception:
+                    pass
+                st["poll"] = None
+            # ① 同步 unmap：屏幕在这一行之后就已经恢复，不依赖窗口销毁时机
             for o in overlays:
                 try:
-                    o.destroy()
+                    o.withdraw()
                 except Exception:
                     pass
             try:
                 self.root.unbind_all("<Escape>")
             except Exception:
                 pass
+
+            # ② 真正的销毁丢到 idle，避开在 <ButtonRelease> 回调里拆自身窗口
+            def _hard_destroy():
+                for o in overlays:
+                    try:
+                        o.destroy()
+                    except Exception:
+                        pass
+
+            try:
+                self.root.after_idle(_hard_destroy)
+            except Exception:
+                _hard_destroy()
+
+            # ③ 唤醒 select_region，不让任何窗口状态卡住调用方
+            try:
+                done_var.set(True)
+            except Exception:
+                pass
+
+        def finish(gx, gy):
+            """处理「松手」：正常 <ButtonRelease> 与兜底轮询共用同一份逻辑。"""
+            if st["done"] or not st["down"]:
+                return
+            st["down"] = False
+            moved = st["moved"]
+            st["moved"] = False
+            if moved:
+                x1, y1 = min(st["dx"], gx), min(st["dy"], gy)
+                x2, y2 = max(st["dx"], gx), max(st["dy"], gy)
+                if x2 - x1 > 3 and y2 - y1 > 3:
+                    result.update(dict(x=x1, y=y1, w=x2 - x1, h=y2 - y1))
+                    destroy()
+                return
+            if st["fx"] is None:
+                st["fx"], st["fy"] = gx, gy
+                dot(gx, gy)
+                return
+            x1, y1 = min(st["fx"], gx), min(st["fy"], gy)
+            x2, y2 = max(st["fx"], gx), max(st["fy"], gy)
+            if x2 - x1 > 3 and y2 - y1 > 3:
+                result.update(dict(x=x1, y=y1, w=x2 - x1, h=y2 - y1))
+                destroy()
+            else:
+                # 两次点击几乎重合：把落点当作新的起点
+                st["fx"], st["fy"] = gx, gy
+                dot(gx, gy)
+
+        def poll_release():
+            """兜底：<ButtonRelease> 丢了也能自己收尾。"""
+            st["poll"] = None
+            if st["done"]:
+                return
+            if st["down"]:
+                try:
+                    held = pb.mouse_left_down()
+                except Exception:
+                    held = True
+                if not held:
+                    gx, gy = st["last"] if st["last"] else (st["dx"], st["dy"])
+                    finish(gx, gy)
+                    if st["done"]:
+                        return
+            try:
+                st["poll"] = self.root.after(120, poll_release)
+            except Exception:
+                st["poll"] = None
 
         self._overlay_open = True
         self.root.bind_all("<Escape>", lambda e: destroy())
@@ -2782,6 +2876,7 @@ class PixelTriggerApp:
             sx, sy, sw, sh = screen
             def motion(e):
                 gx, gy = e.x + sx, e.y + sy
+                st["last"] = (gx, gy)
                 cross(gx, gy)
                 if st["down"] and abs(gx-st["dx"]) + abs(gy-st["dy"]) > 6:
                     st["moved"] = True
@@ -2791,73 +2886,80 @@ class PixelTriggerApp:
                     rect(st["fx"], st["fy"], gx, gy)
             def press(e):
                 gx, gy = e.x + sx, e.y + sy
+                if st["done"]:
+                    return
                 st["down"] = True
                 st["dx"], st["dy"] = gx, gy
                 st["moved"] = False
+                st["last"] = (gx, gy)
                 if st["fx"] is not None:
                     st["dx"], st["dy"] = st["fx"], st["fy"]
                 cross(gx, gy)
             def release(e):
-                if not st["down"]:
+                if st["done"] or not st["down"]:
                     return
-                gx, gy = e.x + sx, e.y + sy
-                if st["moved"]:
-                    x1, y1 = min(st["dx"], gx), min(st["dy"], gy)
-                    x2, y2 = max(st["dx"], gx), max(st["dy"], gy)
-                    if x2-x1 > 3 and y2-y1 > 3:
-                        result.update(dict(x=x1, y=y1, w=x2-x1, h=y2-y1))
-                        destroy()
-                        return
-                else:
-                    if st["fx"] is None:
-                        st["fx"], st["fy"] = gx, gy
-                        dot(gx, gy)
-                    else:
-                        x1, y1 = min(st["fx"], gx), min(st["fy"], gy)
-                        x2, y2 = max(st["fx"], gx), max(st["fy"], gy)
-                        if x2-x1 > 3 and y2-y1 > 3:
-                            result.update(dict(x=x1, y=y1, w=x2-x1, h=y2-y1))
-                            destroy()
-                            return
-                        else:
-                            st["fx"], st["fy"] = gx, gy
-                            dot(gx, gy)
-                st["down"], st["moved"] = False, False
+                finish(e.x + sx, e.y + sy)
             return motion, press, release
 
         first = True
-        for (sx, sy, sw, sh) in screens:
-            ov = tk.Toplevel(self.root)
-            ov.overrideredirect(True)
-            ov.attributes("-topmost", True)
-            ov.configure(bg="black")
-            try:
-                ov.attributes("-alpha", 0.45)
-            except Exception:
-                pass
-            ov.geometry(f"{sw}x{sh}+{sx}+{sy}")
-            c = tk.Canvas(ov, bg="black", highlightthickness=0,
-                          cursor="crosshair", width=sw, height=sh)
-            c.pack(fill="both", expand=True)
-            if first:
-                c.create_text(sw//2, 50,
-                    text="按住拖拽，或点击两次（左上角 → 右下角）   按 ESC 取消",
-                    fill="white", font=(pb.FONT_UI, 18, "bold"))
-                first = False
-            c._ch = c.create_line(0,0,0,0, fill=C_MARK_RED, width=1, state="hidden")
-            c._cv = c.create_line(0,0,0,0, fill=C_MARK_RED, width=1, state="hidden")
-            c._r = c.create_rectangle(0,0,0,0, outline=C_MARK_YELLOW, width=3, state="hidden")
-            c._d = c.create_oval(0,0,0,0, outline=C_MARK_CYAN, width=2, state="hidden")
-            m, p, r = make((sx, sy, sw, sh))
-            c.bind("<Motion>", m)
-            c.bind("<ButtonPress-1>", p)
-            c.bind("<ButtonRelease-1>", r)
-            ov.update_idletasks()
-            ov.lift()
-            overlays.append(ov)
-            canvas_info.append((c, (sx, sy, sw, sh)))
-        if overlays:
-            self.root.wait_window(overlays[0])
+        try:
+            for (sx, sy, sw, sh) in screens:
+                ov = tk.Toplevel(self.root)
+                ov.overrideredirect(True)
+                ov.attributes("-topmost", True)
+                ov.configure(bg="black")
+                try:
+                    ov.attributes("-alpha", 0.45)
+                except Exception:
+                    pass
+                ov.geometry(f"{sw}x{sh}+{sx}+{sy}")
+                c = tk.Canvas(ov, bg="black", highlightthickness=0,
+                              cursor="crosshair", width=sw, height=sh)
+                c.pack(fill="both", expand=True)
+                if first:
+                    c.create_text(sw//2, 50,
+                        text="按住拖拽，或点击两次（左上角 → 右下角）   按 ESC 取消",
+                        fill="white", font=(pb.FONT_UI, 18, "bold"))
+                    first = False
+                c._ch = c.create_line(0,0,0,0, fill=C_MARK_RED, width=1, state="hidden")
+                c._cv = c.create_line(0,0,0,0, fill=C_MARK_RED, width=1, state="hidden")
+                c._r = c.create_rectangle(0,0,0,0, outline=C_MARK_YELLOW, width=3, state="hidden")
+                c._d = c.create_oval(0,0,0,0, outline=C_MARK_CYAN, width=2, state="hidden")
+                m, p, r = make((sx, sy, sw, sh))
+                c.bind("<Motion>", m)
+                c.bind("<ButtonPress-1>", p)
+                c.bind("<ButtonRelease-1>", r)
+                # 窗口级别再绑一次：万一 canvas 没拿到按钮抓取，松手也有人接
+                ov.bind("<ButtonRelease-1>", r)
+                ov.update_idletasks()
+                ov.lift()
+                # 抢键盘焦点：override-redirect 窗口默认不激活应用，不抢的话
+                # ESC 会被送到前台其它应用，遮罩就再也退不掉了
+                try:
+                    ov.focus_force()
+                    c.focus_set()
+                except Exception:
+                    pass
+                overlays.append(ov)
+                canvas_info.append((c, (sx, sy, sw, sh)))
+            if not overlays:
+                return
+            st["poll"] = self.root.after(120, poll_release)
+            self.root.wait_variable(done_var)
+        except Exception as e:
+            # 建窗口 / 等结果任一步出错，都必须先把遮罩收掉再往外抛，
+            # 否则用户会被一层点不动的黑纱困住 —— 这正是本函数要杜绝的状态。
+            self.log_msg(f"⚠️ 框选界面异常：{e}")
+            destroy()
+        finally:
+            # 兜底复位：无论走哪条路，都不能让 _overlay_open 永久为 True
+            # （为 True 时主题重建/模式切换会一直被跳过）
+            if not overlays or st["done"]:
+                self._overlay_open = False
+                try:
+                    self.root.unbind_all("<Escape>")
+                except Exception:
+                    pass
         if result["x"] is not None:
             self.vars["x"].set(str(result["x"]))
             self.vars["y"].set(str(result["y"]))
@@ -2871,6 +2973,7 @@ class PixelTriggerApp:
                                    result["w"], result["h"])
         else:
             self.log_msg("⏱ 已取消框选")
+
 
     def take_snapshot(self, x, y, w, h):
         try:
