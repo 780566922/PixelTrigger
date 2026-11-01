@@ -1,6 +1,6 @@
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
-from PIL import Image, ImageTk
+from PIL import Image, ImageChops, ImageTk
 import subprocess
 import time
 import os
@@ -172,15 +172,64 @@ DEFAULT_CONFIG = {
     # 为物理像素（"physical"）；缺失或为旧值表示 v1.2.0 之前的
     # 「DPI 虚拟化逻辑像素」坐标，加载时按缩放系数迁移。
     "coord_space": "",
+    # 界面模式："compact"（简化，默认）/ "full"（完整设置）。
+    # 日常使用只需要「看检测区域 + 开始/停止」，简化模式窗口小、
+    # 不挡其他软件；需要调参时右上角一键切到完整模式。
+    "ui_mode": "compact",
 }
+
+# ============================================================
+# 数值容错解析
+#
+# 历史坑：save_config 之后 load_config 把数值统一存成 str(float(val))，
+# 于是 "1062" 变成 "1062.0" 回到界面与运行时快照。监控线程里写的是
+# int(live["x"])，遇到 "1062.0" 直接 ValueError，被外层 `except: continue`
+# 吞掉 —— 界面看着一切正常，实际一帧都没扫，用户只看到「配置保存了却
+# 不生效」。所以凡是读配置/读输入框的地方，一律先用这里的容错函数，
+# 并且保存时把数值归一化成最简写法（498.0 -> "498"）。
+# ============================================================
+def to_float(val, default=None):
+    """字符串/数字 -> float，失败返回 default（绝不抛异常）。"""
+    if isinstance(val, bool):
+        return default
+    if isinstance(val, (int, float)):
+        return float(val)
+    try:
+        return float(str(val).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def to_int(val, default=0):
+    """字符串/数字 -> int（"498.0" 也能正确得到 498）。"""
+    f = to_float(val)
+    return default if f is None else int(f)
+
+
+def num_str(val):
+    """把数值归一化成最简字符串："498.0" -> "498"，"0.650" -> "0.65"。"""
+    f = to_float(val)
+    if f is None:
+        return str(val).strip()
+    if f == int(f):
+        return str(int(f))
+    return ("%.6f" % f).rstrip("0").rstrip(".")
+
 
 PREVIEW_INTERVAL = 1.0
 PREVIEW_HOLD_AFTER = 3.0
 COUNTDOWN_TICK_MS = 100
 PERM_CHECK_MS = 1000
+# 参数改动后自动落盘的防抖时长（毫秒）。改动即存，用户再也不会遇到
+# 「退出时选了保存却没保存 / 下次打开配置丢了」。
+AUTOSAVE_DEBOUNCE_MS = 600
 # 主线程 UI 派发队列的轮询间隔（毫秒）。后台线程的 UI 更新经过
 # 该队列收口到主线程，避免跨线程操作 Tk 导致崩溃。
 UI_POLL_MS = 30
+# 两种界面模式的最小窗口尺寸：简化模式只放预览 + 开始/停止，
+# 可以缩到很小的常驻窗口；完整模式需要容纳左右两栏参数。
+MIN_COMPACT_W, MIN_COMPACT_H = 380, 360
+MIN_FULL_W, MIN_FULL_H = 1000, 650
 
 # 系统外观轮询间隔。macOS 没有公开的「外观变化」广播通知，
 # 只能轮询 AppleInterfaceStyle；1 秒足以让肉眼感知为实时，
@@ -594,40 +643,57 @@ def match_precise(r, g, b, r0, g0, b0, tol):
     return (abs(r - r0) <= tol and abs(g - g0) <= tol and abs(b - b0) <= tol)
 
 
+def _tol_lut(c, tol):
+    """单通道容差查找表：|v - c| <= tol 的位置为 255，其余为 0。"""
+    lo, hi = c - tol, c + tol
+    return [255 if lo <= v <= hi else 0 for v in range(256)]
+
+
+def _scan_dense(img, target, mc, step):
+    """向量化的**全像素**扫描。
+
+    做法把「三通道各自做容差判定，再求交集」全部交给 PIL 的 C 实现：
+    逐通道 point() 查表得到 0/255 掩膜 -> ImageChops.darker 取交集
+    -> tobytes() 后按行 count(255) 统计命中像素数。
+
+    为什么值得这么改：旧实现是 Python 层逐像素做三次绝对值比较，
+    283×118 的区域一帧就要 10ms 以上，为了压住开销只能「每隔 step 行
+    才扫一行」——细的蓝线正好落在被跳过的那几行上就漏检，观感上就是
+    「检测太稀疏」。向量化后整帧是毫秒级，所以默认可以对每个像素都判定，
+    既稠密又比原来更省 CPU。
+    """
+    r0, g0, b0, tol = target
+    tol = max(0, int(tol))
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    rr, gg, bb = img.split()
+    mask = ImageChops.darker(
+        ImageChops.darker(rr.point(_tol_lut(r0, tol)),
+                          gg.point(_tol_lut(g0, tol))),
+        bb.point(_tol_lut(b0, tol)))
+    w, _h = mask.size
+    data = mask.tobytes()
+    if step <= 1:
+        return data.count(255)
+    count = 0
+    for y in range(0, _h, step):
+        count += data[y * w:(y + 1) * w].count(255)
+        if count >= mc:
+            break
+    return count
+
+
 def scan_region(img, matcher, mc, sample_step, target=None):
     w, h = img.size
-    step = max(1, sample_step)
-    count = 0
-    # 热路径优化：当提供 target=(r0,g0,b0,tol) 时（loop 中的唯一用法），
-    # 直接将 RGB 数据读入内存视图逐行扫描，避免每像素一次 img.load()
-    # 字典查找与 matcher 函数调用开销。否则回退到通用逐像素 matcher。
+    step = max(1, int(sample_step))
+    # 热路径：loop 里唯一用法，走向量化全像素扫描（含 step>1 的行抽样）。
     if target is not None:
-        r0, g0, b0, tol = target
         try:
-            raw = img.tobytes("raw", "RGB")
+            return _scan_dense(img, target, int(mc), step)
         except Exception:
-            raw = None
-        if raw is not None:
-            view = memoryview(raw)
-            row_bytes = w * 3
-            y = 0
-            while y < h:
-                row = view[y * row_bytes:(y + 1) * row_bytes]
-                i = 0
-                while i < row_bytes:
-                    r = row[i]
-                    g = row[i + 1]
-                    b = row[i + 2]
-                    if (r - r0 if r >= r0 else r0 - r) <= tol and \
-                       (g - g0 if g >= g0 else g0 - g) <= tol and \
-                       (b - b0 if b >= b0 else b0 - b) <= tol:
-                        count += 1
-                        if count >= mc:
-                            return count
-                    i += 3
-                y += step
-            return count
-    # 通用回退路径
+            pass  # 任何异常（老版本 Pillow / 异常图像模式）都退回通用路径
+    # 通用回退路径（逐像素 matcher）
+    count = 0
     pixels = img.load()
     y = 0
     while y < h:
@@ -721,7 +787,10 @@ class PixelTriggerApp:
         self.root.title("PixelTrigger")
         self.root.configure(bg=C_WINDOW_BG)
         self.root.resizable(True, True)
-        self.root.minsize(1000, 650)
+        # 界面模式在读完配置后才能确定，这里先给个占位，
+        # 真正的 minsize 由 _apply_mode_window 设置。
+        self._compact = True
+        self.root.minsize(MIN_COMPACT_W, MIN_COMPACT_H)
 
         self.running = False
         self.stop_event = threading.Event()
@@ -776,6 +845,8 @@ class PixelTriggerApp:
         self.key_combo_str = "Next"
 
         self.cfg_values = self.load_config()
+        # 默认简化模式：日常只需要「看区域 + 开始/停止」，窗口小不挡事。
+        self._compact = self.cfg_values.get("ui_mode", "compact") != "full"
         try:
             self.selected_hue = (
                 int(float(self.cfg_values.get("hue_r", "0"))),
@@ -795,16 +866,45 @@ class PixelTriggerApp:
         # None 表示尚在启动阶段、不安排回显，避免一启动就刷一条日志。
         self._param_echo_job = None
         self._param_echo_last = None
+        # 自动保存：任何参数改动都会在 AUTOSAVE_DEBOUNCE_MS 后落盘。
+        # 「退出时手动选保存」这条链路是整个项目最容易丢配置的地方
+        # （对话框没弹/点了取消/直接 Cmd+Q 都会丢），索性改成改动即存。
+        self._autosave_job = None
+        self._autosave_ready = False
+        self.save_state_var = tk.StringVar(value="")
+        # 监控区域非法时只提示一次，避免每 0.5 秒刷一条日志
+        self._region_warned = False
+        # 全局快捷键状态：失败时等「辅助功能」授权后自动补注册一次
+        self._hotkey_ok = False
+        self._hotkey_retried = False
         self._build_ui()
         self._update_live()
         self._param_echo_last = self._param_echo_sig()
 
         self._initial_snapshot = self._snapshot_all()
+        # 从这里开始才允许自动保存：之前的 _update_live 只是装载初始值，
+        # 不应该反过来再写一次磁盘。
+        self._autosave_ready = True
+        # 启动即回显配置来源，用户从此不用猜「配置到底存在哪、
+        # 到底有没有被读到」。
+        try:
+            state = "已加载" if os.path.exists(CONFIG_FILE) else "首次生成"
+            self.log_msg(f"📄 配置{state}：{CONFIG_FILE}")
+        except Exception:
+            pass
+        self._set_save_state(True, initial=True)
 
         self._tick_permissions()
         self._tick_theme()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.root.after(10, self._fit_and_center)
+        # 窗口内快捷键：⌘↩（macOS）/ Ctrl+Enter（Windows）开始或停止
+        try:
+            seq = "<Command-Return>" if pb.IS_MAC else "<Control-Return>"
+            self.root.bind_all(seq, self._toggle_monitor)
+        except Exception:
+            pass
+        self.root.after(10, self._apply_mode_window)
+        self._start_global_hotkey()
 
         # 启动时若检测到从 DMG 卷运行，弹窗强提示——这是权限红点的最常见根因。
         # 用户从 DMG 直接双击运行，挂载路径不稳定（重复挂载变 /Volumes/xxx 1），
@@ -854,7 +954,7 @@ class PixelTriggerApp:
             sh = self.root.winfo_screenheight()
             req_w = self.root.winfo_reqwidth()
             req_h = self.root.winfo_reqheight()
-            min_w, min_h = 1000, 650
+            min_w, min_h = MIN_FULL_W, MIN_FULL_H
             max_w, max_h = sw - 60, sh - 100
             w = max(min_w, min(max_w, req_w))
             h = max(min_h, min(max_h, req_h))
@@ -900,12 +1000,13 @@ class PixelTriggerApp:
                         continue
                     val = saved[k]
                     if k in self._NUMERIC_KEYS:
-                        try:
-                            # 数值字段校验：仅接受可解析为数字的标量
-                            cfg[k] = str(float(val))
-                        except (TypeError, ValueError):
-                            # 非法值（数组/对象/非数字）回退到默认值
-                            continue
+                        # 数值字段：容错解析并归一化成最简写法（498.0 -> "498"）。
+                        # 旧实现写回 str(float(val))，让界面与运行时快照里
+                        # 出现 "498.0"，监控线程 int() 解析直接抛错 —— 这就是
+                        # 「配置保存了但下次打开不生效」的根因。
+                        if to_float(val) is None:
+                            continue  # 非法值（数组/对象/非数字）回退默认
+                        cfg[k] = num_str(val)
                     else:
                         cfg[k] = str(val)
             except Exception:
@@ -933,6 +1034,10 @@ class PixelTriggerApp:
     def save_config(self):
         try:
             data = {k: v.get() for k, v in self.vars.items()}
+            # 数值统一归一化：避免用户手输 "498.0" 之类写法被原样存进磁盘，
+            # 让配置文件人眼可读、也让下次加载的数值一定是最简形式。
+            for k in self._NUMERIC_KEYS & set(data):
+                data[k] = num_str(data[k])
             data.update({
                 "color_mode": self.color_mode.get(),
                 "trigger_mode": self.trigger_mode.get(),
@@ -945,6 +1050,8 @@ class PixelTriggerApp:
                 "hue_tol": str(self.hue_tol),
                 # Windows 框选坐标空间标记（物理像素），供版本升级迁移
                 "coord_space": "physical" if pb.IS_WIN else "points",
+                # 记住用户上次用的界面模式，下次启动直接进同一个界面
+                "ui_mode": "compact" if self._compact else "full",
             })
             with open(CONFIG_FILE, "w") as f:
                 json.dump(data, f, indent=2)
@@ -952,6 +1059,71 @@ class PixelTriggerApp:
         except Exception as e:
             self.log_msg(f"⚠️ 配置保存失败：{e}")
             return False
+
+    # ---------- 自动保存 ----------
+    def _schedule_autosave(self):
+        """参数一变就排一次落盘（防抖），由主线程执行。"""
+        if not self._autosave_ready or self._closing:
+            return
+        # 主题重建期间控件正在销毁重建，此刻的 vars 是半成品，
+        # 绝不能拿去覆盖磁盘上的好配置。
+        if getattr(self, "_rebuilding", False):
+            return
+        if self._autosave_job:
+            try:
+                self.root.after_cancel(self._autosave_job)
+            except Exception:
+                pass
+        try:
+            self._autosave_job = self.root.after(
+                AUTOSAVE_DEBOUNCE_MS, self._do_autosave)
+        except Exception:
+            self._autosave_job = None
+
+    def _do_autosave(self):
+        self._autosave_job = None
+        if self._closing:
+            return
+        ok = self.save_config()
+        self._set_save_state(ok)
+
+    def _set_save_state(self, ok, initial=False):
+        """顶栏的保存状态灯：让「存了没有」这件事一眼可见。"""
+        try:
+            if ok:
+                if initial:
+                    text = "已加载配置"
+                elif self._compact:
+                    # 简化模式窗口窄，只留一个短标识，避免挤掉「完整设置」
+                    text = "✓ 已保存"
+                else:
+                    text = "✓ 已自动保存 " + time.strftime("%H:%M:%S")
+                self.save_state_var.set(text)
+                self.save_state_label.configure(fg=C_GREEN)
+            else:
+                self.save_state_var.set("⚠ 保存失败")
+                self.save_state_label.configure(fg=C_RED)
+        except Exception:
+            pass
+
+    def flush_config(self):
+        """立即落盘（退出前兜底，跳过防抖）。"""
+        if self._autosave_job:
+            try:
+                self.root.after_cancel(self._autosave_job)
+            except Exception:
+                pass
+            self._autosave_job = None
+        if not self._has_changes():
+            return True
+        return self.save_config()
+
+    def open_config_dir(self):
+        """在访达/资源管理器里定位配置文件，回答「配置到底存在哪」。"""
+        try:
+            pb.reveal_in_file_manager(CONFIG_FILE)
+        except Exception as e:
+            self.log_msg(f"⚠️ 无法打开配置目录：{e}")
 
     def _snapshot_all(self):
         snap = {}
@@ -1010,16 +1182,271 @@ class PixelTriggerApp:
 
     def _build_ui(self):
         self.vars = {}
-        self.root.rowconfigure(0, weight=0)
-        self.root.rowconfigure(1, weight=0)
-        self.root.rowconfigure(2, weight=0)
-        self.root.rowconfigure(3, weight=0)
+        for i in range(4):
+            self.root.rowconfigure(i, weight=0)
         self.root.columnconfigure(0, weight=1)
 
+        if self._compact:
+            self._build_compact_ui()
+        else:
+            self._build_full_ui()
+
+    def _build_full_ui(self):
         self._build_topbar()
         self._build_main()
         self._build_params_bar()
         self._build_log_area()
+
+    # ============================================================
+    # 简化模式
+    #
+    # 日常只做一件事：盯着检测区域、看到蓝线就上滑。所以这个界面只留
+    # 「检测区域预览 + 状态 + 开始/停止」，窗口约 420×430，可以常驻在
+    # 乐谱/文档旁边。所有参数仍然生效（值来自配置），需要调时点右上角
+    # 「⚙ 完整设置」切过去。
+    # ============================================================
+    def _make_headless_vars(self):
+        """只建变量、不建控件。
+
+        简化模式隐藏了参数输入框，但运行时快照 self.live、保存逻辑、
+        监控线程读的都是 self.vars —— 缺任何一个 key 都会让监控静默
+        用默认值甚至直接不扫。所以这里的 key 集合必须与完整模式一致。
+        """
+        keys = ("x", "y", "w", "h", "br", "bg", "mb", "mc", "it", "cd",
+                "sample_step", "total_pixels", "duration",
+                "precise_r", "precise_g", "precise_b",
+                "key_repeat_count", "key_repeat_interval", "key_hold_duration")
+        for key in keys:
+            v = tk.StringVar(value=self.cfg_values.get(
+                key, DEFAULT_CONFIG.get(key, "")))
+            v.trace_add("write", self._update_live)
+            self.vars[key] = v
+        if pb.IS_WIN:
+            v = tk.StringVar(value=self.cfg_values.get(
+                "win_scroll_density",
+                DEFAULT_CONFIG.get("win_scroll_density", "1.0")))
+            v.trace_add("write", self._update_live)
+            self.vars["win_scroll_density"] = v
+
+        self.tol_var = tk.IntVar(value=to_int(self.cfg_values.get(
+            "precise_tol", "30"), 30))
+        self.tol_var.trace_add("write", self._update_live)
+        self.vars["precise_tol"] = self.tol_var
+
+        self.color_mode = tk.StringVar(
+            value=self.cfg_values.get("color_mode", "hue"))
+        self.trigger_mode = tk.StringVar(
+            value=self.cfg_values.get("trigger_mode", "scroll"))
+        self.scroll_dir = tk.StringVar(
+            value=self.cfg_values.get("scroll_dir", "up"))
+        self.key_action = tk.StringVar(
+            value=self.cfg_values.get("key_action", "press"))
+        self.key_display_var = tk.StringVar(
+            value=format_key_display(self.key_combo_str))
+        self.scroll_hint_var = tk.StringVar(value="")
+        # 完整模式里这两个由对应卡片创建；简化模式没有卡片，显式置空，
+        # 让 _on_mode_change / _on_trigger_mode_change 走空操作分支。
+        self.hue_panel = self.precise_panel = None
+        self.scroll_panel = self.key_panel = None
+        self.repeat_panel = self.hold_panel = None
+
+    def _build_compact_ui(self):
+        self._make_headless_vars()
+        # 权限圆点只在完整模式显示；置 None 让 _tick_permissions_once 走跳过分支
+        self.screen_perm_frame = self.screen_perm_dot = self.screen_perm_lbl = None
+        self.ax_perm_frame = self.ax_perm_dot = self.ax_perm_lbl = None
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(2, weight=1)   # 只有预览区可伸缩
+
+        # ---- 标题栏 ----
+        top = tk.Frame(self.root, bg=C_WINDOW_BG)
+        top.grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 4))
+
+        left = tk.Frame(top, bg=C_WINDOW_BG)
+        left.pack(side="left")
+        tk.Label(left, text="🎯 PixelTrigger", bg=C_WINDOW_BG, fg=C_TITLE,
+                 font=(pb.FONT_UI, 15, "bold")).pack(side="left")
+        self.app_version = get_app_version()
+        if self.app_version:
+            tk.Label(left, text=f"v{self.app_version}",
+                     bg=C_WINDOW_BG, fg=C_GRAY_DISABLED_FG,
+                     font=(pb.FONT_MONO, 9)).pack(side="left", pady=(6, 0),
+                                                   padx=(6, 0))
+
+        right = tk.Frame(top, bg=C_WINDOW_BG)
+        right.pack(side="right")
+        ttk.Button(right, text="⚙ 完整设置", width=9,
+                   command=self._switch_ui_mode).pack(side="right")
+
+        self.save_state_label = tk.Label(
+            top, textvariable=self.save_state_var,
+            bg=C_WINDOW_BG, fg=C_GRAY_DISABLED_FG,
+            font=(pb.FONT_UI, 9), cursor=pb.HAND_CURSOR)
+        self.save_state_label.pack(side="right", padx=(0, 10))
+        self.save_state_label.bind("<Button-1>", lambda e: self.open_config_dir())
+        ToolTip(self.save_state_label,
+                f"参数改动会自动保存到：\n{CONFIG_FILE}\n\n点击在文件夹中显示")
+
+        # ---- 状态行 ----
+        st = tk.Frame(self.root, bg=C_WINDOW_BG)
+        st.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 6))
+        self.status_dot = tk.Label(st, text="●", bg=C_WINDOW_BG,
+                                   font=(pb.FONT_UI, 15),
+                                   fg=C_GRAY_DISABLED_FG)
+        self.status_dot.pack(side="left", padx=(0, 6))
+        self.status_var = tk.StringVar(value="未运行")
+        self.status_label = tk.Label(st, textvariable=self.status_var,
+                                     bg=C_WINDOW_BG, fg=C_SUBTEXT,
+                                     font=(pb.FONT_UI, 14, "bold"), anchor="w")
+        self.status_label.pack(side="left")
+        self.match_var = tk.StringVar(value="匹配像素：—")
+        tk.Label(st, textvariable=self.match_var, bg=C_WINDOW_BG,
+                 fg=C_SUBTEXT, font=(pb.FONT_MONO, 9),
+                 anchor="e").pack(side="right")
+
+        # ---- 检测区域预览（主体）----
+        prev_outer = tk.Frame(self.root, bg=C_WINDOW_BG)
+        prev_outer.grid(row=2, column=0, sticky="nsew", padx=14, pady=(0, 8))
+        prev_outer.rowconfigure(0, weight=1)
+        prev_outer.columnconfigure(0, weight=1)
+        _outer, body = self._make_card(prev_outer, "检测区域")
+        _outer.grid(row=0, column=0, sticky="nsew")
+        preview_box = tk.Frame(body, bg=C_PREVIEW_BG,
+                               highlightbackground=C_CARD_BORDER,
+                               highlightthickness=1, width=1, height=1)
+        preview_box.pack(fill="both", expand=True)
+        preview_box.pack_propagate(False)
+        self.preview_label = tk.Label(preview_box, text="（未运行）",
+                                       bg=C_PREVIEW_BG, fg=C_SUBTEXT,
+                                       font=(pb.FONT_UI, 11))
+        self.preview_label.pack(fill="both", expand=True)
+        # 简化模式没有「框选」按钮，双击预览即可重新框选区域
+        self.preview_label.bind("<Double-Button-1>",
+                                lambda e: self.select_region())
+        ToolTip(self.preview_label,
+                "双击重新框选监控区域\n（其余参数在「⚙ 完整设置」里）")
+
+        # ---- 操作行 ----
+        ops = tk.Frame(self.root, bg=C_WINDOW_BG)
+        ops.grid(row=3, column=0, sticky="ew", padx=14, pady=(0, 14))
+
+        self.start_btn = FancyButton(
+            ops, "▶   开始",
+            bg_normal=C_GREEN, bg_hover=C_GREEN_H,
+            bg_disabled=C_GRAY_DISABLED,
+            fg_normal=C_ON_LIGHT_BTN, fg_hover=C_ON_LIGHT_BTN_H,
+            fg_disabled=C_GRAY_DISABLED_FG,
+            command=self.start)
+        self.start_btn.pack(side="left")
+
+        self.stop_btn = FancyButton(
+            ops, "■   停止",
+            bg_normal=C_RED, bg_hover=C_RED_H,
+            bg_disabled=C_GRAY_DISABLED,
+            fg_normal=C_ON_RED_BTN, fg_hover=C_ON_RED_BTN_H,
+            fg_disabled=C_GRAY_DISABLED_FG,
+            command=self.stop)
+        self.stop_btn.pack(side="left", padx=(8, 0))
+        self.stop_btn.set_enabled(False)
+
+        hint = "⌘↩ 开始/停止" if pb.IS_MAC else "Ctrl+Enter 开始/停止"
+        if pb.global_hotkey_supported():
+            hint += f"　全局 {pb.HOTKEY_LABEL}"
+        tk.Label(ops, text=hint, bg=C_WINDOW_BG, fg=C_GRAY_DISABLED_FG,
+                 font=(pb.FONT_UI, 9)).pack(side="right")
+
+        # ---- 隐藏的日志控件 ----
+        # log_msg 会往 self.log 里写；这里不显示，但必须存在，
+        # 否则每次写日志都抛 AttributeError。
+        self.log = scrolledtext.ScrolledText(
+            self.root, state="disabled", wrap="word", width=1, height=4,
+            font=(pb.FONT_MONO, 9), relief="flat", bd=0, highlightthickness=0,
+            bg=C_ENTRY_BG, fg=C_SUBTEXT, insertbackground=C_SUBTEXT)
+
+    def _switch_ui_mode(self):
+        """在简化 / 完整界面之间切换，参数与运行状态原样保留。"""
+        state = self._capture_ui_state()
+        old_preview = self.preview_image
+        self._rebuilding = True
+        try:
+            for child in self.root.winfo_children():
+                try:
+                    child.destroy()
+                except Exception:
+                    pass
+            self.vars = {}
+            self._hue_borders = []
+            self.preview_image = None
+            self._compact = not self._compact
+            self._build_ui()
+            self._restore_ui_state(state)
+            if old_preview is not None:
+                try:
+                    self.preview_image = old_preview
+                    self.preview_label.configure(image=old_preview, text="")
+                except Exception:
+                    self.preview_image = None
+        finally:
+            self._rebuilding = False
+        self._update_live()
+        self._apply_mode_window()
+        self.save_config()
+        self.log_msg("🪟 已切换到" + ("简化模式" if self._compact else "完整模式"))
+
+    def _apply_mode_window(self):
+        """按模式调整窗口最小尺寸与初始大小。"""
+        try:
+            if self._compact:
+                self.root.minsize(MIN_COMPACT_W, MIN_COMPACT_H)
+                self.root.geometry("")
+                self.root.update_idletasks()
+                cur_w = self.root.winfo_width()
+                cur_h = self.root.winfo_height()
+                w = max(MIN_COMPACT_W, min(cur_w, 560))
+                h = max(MIN_COMPACT_H, min(cur_h, 620))
+                sw = self.root.winfo_screenwidth()
+                sh = self.root.winfo_screenheight()
+                x = max(20, sw - w - 40)
+                y = max(40, (sh - h) // 2)
+                self.root.geometry(f"{w}x{h}+{x}+{y}")
+            else:
+                self.root.minsize(MIN_FULL_W, MIN_FULL_H)
+                self.root.geometry("")
+                self.root.after(10, self._fit_and_center)
+        except Exception:
+            pass
+
+    def _toggle_monitor(self, event=None):
+        """快捷键：开始 / 停止 一键切换。"""
+        try:
+            if self.running:
+                self.stop()
+            else:
+                self.start()
+        except Exception:
+            pass
+        return "break"
+
+    def _start_global_hotkey(self):
+        """注册全局快捷键（macOS ⌃⌥↩）：人不用切回本窗口就能启停。"""
+        if not pb.global_hotkey_supported():
+            return False
+        if getattr(self, "_hotkey_ok", False):
+            return True
+        # 事件线程不能碰 Tk，统一投递到主线程队列
+        def _fire():
+            self._post_ui(self._toggle_monitor)
+        try:
+            ok = pb.register_global_hotkey(_fire)
+        except Exception:
+            ok = False
+        self._hotkey_ok = bool(ok)
+        if ok:
+            self.log_msg(f"⌨️ 全局快捷键已就绪：{pb.HOTKEY_LABEL} 开始 / 停止监控")
+        else:
+            self.log_msg("⌨️ 全局快捷键注册失败（多为「辅助功能」权限未授予），"
+                         "授予权限后会自动重试；期间可用窗口内 ⌘↩")
+        return self._hotkey_ok
 
     def _build_topbar(self):
         top = tk.Frame(self.root, bg=C_WINDOW_BG)
@@ -1040,6 +1467,23 @@ class PixelTriggerApp:
                      bg=C_WINDOW_BG, fg=C_GRAY_DISABLED_FG,
                      font=(pb.FONT_MONO, 9)).pack(side="left", pady=(10, 0),
                                                    padx=(6, 0))
+
+        # 配置状态：改动即存，存完这里会变成「✓ 已自动保存 12:34:56」。
+        # 点它可以直接在访达里定位 config.json —— 用户不用再猜配置存哪了。
+        self.save_state_label = tk.Label(
+            left, textvariable=self.save_state_var,
+            bg=C_WINDOW_BG, fg=C_GRAY_DISABLED_FG,
+            font=(pb.FONT_UI, 9), cursor=pb.HAND_CURSOR)
+        self.save_state_label.pack(side="left", pady=(10, 0), padx=(12, 0))
+        for w in (self.save_state_label,):
+            w.bind("<Button-1>", lambda e: self.open_config_dir())
+        ToolTip(self.save_state_label,
+                f"参数改动会自动保存到：\n{CONFIG_FILE}\n\n点击在文件夹中显示")
+
+        # 简 / 全 两种界面一键切换：完整模式里改完参数可以立刻缩回小窗。
+        ttk.Button(left, text="🗕 简化模式", width=9,
+                   command=self._switch_ui_mode).pack(side="left", pady=(6, 0),
+                                                      padx=(10, 0))
 
         right = tk.Frame(top, bg=C_WINDOW_BG)
         right.pack(side="right")
@@ -1501,8 +1945,16 @@ class PixelTriggerApp:
                   ("最低亮度", "mb", "100"), ("最少像素", "mc", "5"),
                   ("检测间隔", "it", "0.08"), ("采样步长", "sample_step", "1")]
         for i, (lbl, key, dft) in enumerate(fields):
-            f, _ = self._make_field(r, lbl, key, default=dft, width=6)
+            f, _e = self._make_field(r, lbl, key, default=dft, width=6)
             f.pack(side="left", padx=(0 if i == 0 else 14, 0))
+            if key == "sample_step":
+                # 现在整帧扫描是向量化的（PIL 的 C 实现），保持 1 也很快，
+                # 不值得为了省 CPU 去跳像素——跳像素正是「细蓝线漏检」的根源。
+                ToolTip(_e, "1 = 每个像素都检测（推荐，最稠密）\n"
+                            "2 = 每隔 1 行/列取 1，以此类推（仅在超大区域时使用）")
+            elif key == "it":
+                ToolTip(_e, "每轮检测之间的间隔（秒）\n"
+                            "0.08 ≈ 每秒 12 次；区域很大时可以适当调大")
 
     def _build_log_area(self):
         log_row = tk.Frame(self.root, bg=C_WINDOW_BG)
@@ -1538,6 +1990,10 @@ class PixelTriggerApp:
         self.log.pack(fill="both", expand=True)
 
     def _on_mode_change(self):
+        # 简化模式没有这两个面板，直接跳过显隐逻辑
+        if getattr(self, "hue_panel", None) is None:
+            self._update_live()
+            return
         if self.color_mode.get() == "hue":
             self.precise_panel.pack_forget()
             self.hue_panel.pack(fill="x", pady=(2, 0))
@@ -1549,6 +2005,9 @@ class PixelTriggerApp:
         self._update_live()
 
     def _on_trigger_mode_change(self):
+        if getattr(self, "scroll_panel", None) is None:
+            self._update_live()
+            return
         if self.trigger_mode.get() == "scroll":
             self.key_panel.pack_forget()
             self.scroll_panel.pack(fill="x", pady=(4, 0))
@@ -1673,6 +2132,9 @@ class PixelTriggerApp:
                          daemon=True).start()
 
     def _on_key_action_change(self):
+        if getattr(self, "repeat_panel", None) is None:
+            self._update_live()
+            return
         a = self.key_action.get()
         if a == "repeat":
             self.hold_panel.pack_forget()
@@ -1741,6 +2203,7 @@ class PixelTriggerApp:
         self._apply_scroll_tuning()
         self._refresh_scroll_hint()
         self._schedule_param_echo()
+        self._schedule_autosave()
         self._maybe_adjust_cooldown()
 
     def _maybe_adjust_cooldown(self):
@@ -2146,6 +2609,9 @@ class PixelTriggerApp:
         finally:
             self._rebuilding = False
 
+        # 重建期间被跳过的自动保存，这里补一次（值已还原，正是该落盘的状态）
+        self._update_live()
+
         # 权限圆点由 _tick_permissions 下一轮刷新，这里主动同步一次，
         # 免得重建后有最长 1 秒显示成默认灰色
         try:
@@ -2221,6 +2687,14 @@ class PixelTriggerApp:
 
         self._last_screen_perm = self.has_screen
         self._last_ax_perm = self.has_ax
+
+        # 辅助功能权限是全局快捷键的前提：刚被授予时补注册一次，
+        # 免得用户必须重启应用才能用上 ⌃⌥↩。
+        if self.has_ax and pb.global_hotkey_supported() \
+                and not getattr(self, "_hotkey_ok", False) \
+                and not getattr(self, "_hotkey_retried", False):
+            self._hotkey_retried = True
+            self._start_global_hotkey()
 
     def open_screen_settings(self):
         if self.has_screen:
@@ -2479,6 +2953,19 @@ class PixelTriggerApp:
         self.status_dot.configure(fg=C_GREEN)
 
         self.log_msg("▶ 开始监控（所有参数实时生效）")
+        # 回显真实的扫描规模：让「检测有多稠密」可见，也便于对照性能。
+        try:
+            _x = to_int(self.live.get("x"), 0)
+            _y = to_int(self.live.get("y"), 0)
+            _w = max(1, to_int(self.live.get("w"), 1))
+            _h = max(1, to_int(self.live.get("h"), 1))
+            _step = max(1, to_int(self.live.get("sample_step"), 1))
+            _pts = (len(range(0, _w, _step)) * len(range(0, _h, _step)))
+            _mode = "全像素稠密" if _step == 1 else f"每 {_step} 像素取 1"
+            self.log_msg(f"🔍 监控区域 {_w}×{_h} @({_x},{_y})，"
+                         f"扫描方式：{_mode}，共 {_pts} 个采样点")
+        except Exception:
+            pass
         self._stop_countdown_ticker()
         self._start_countdown_ticker()
         self.worker = threading.Thread(target=self.loop, daemon=True)
@@ -2577,31 +3064,36 @@ class PixelTriggerApp:
 
             t0 = time.time()
             live = dict(self.live)
-            try:
-                x = int(live["x"]); y = int(live["y"])
-                w = max(1, int(live["w"])); h = max(1, int(live["h"]))
-            except Exception:
+            # 容错解析：配置里可能是 "498.0"（旧版本写法）或用户刚敲到一半
+            # 的空串/半截数字。任何一项解析不出来都**不能**静默 continue，
+            # 否则表现为「界面正常但一帧都不扫」，所以要显式提示一次。
+            x = to_int(live.get("x"), None)
+            y = to_int(live.get("y"), None)
+            w = to_int(live.get("w"), None)
+            h = to_int(live.get("h"), None)
+            if x is None or y is None or w is None or h is None:
+                if not self._region_warned:
+                    self._region_warned = True
+                    self.log_msg("⚠️ 监控区域未设置（X/Y/宽/高含非法值），"
+                                 "请点「📐 点击框选屏幕区域」重新框选")
                 self.stop_event.wait(0.5)
                 continue
+            self._region_warned = False
+            w = max(1, w); h = max(1, h)
 
             mode = live.get("color_mode", "hue")
             if mode == "hue":
                 r0, g0, b0 = live.get("selected_hue", (0, 122, 255))
-                tol = int(live.get("hue_tol", 70))
+                tol = to_int(live.get("hue_tol"), 70)
             else:
-                try:
-                    r0 = int(live["precise_r"]); g0 = int(live["precise_g"])
-                    b0 = int(live["precise_b"])
-                    tol = int(live.get("precise_tol", "30"))
-                except Exception:
-                    r0, g0, b0, tol = 0, 122, 255, 70
+                r0 = to_int(live.get("precise_r"), 0)
+                g0 = to_int(live.get("precise_g"), 122)
+                b0 = to_int(live.get("precise_b"), 255)
+                tol = to_int(live.get("precise_tol"), 30)
 
-            try:
-                mc = int(live.get("mc", "5"))
-                it = float(live.get("it", "0.08"))
-                step = max(1, int(live.get("sample_step", "1")))
-            except Exception:
-                mc, it, step = 5, 0.08, 1
+            mc = max(1, to_int(live.get("mc"), 5))
+            it = max(0.01, to_float(live.get("it"), 0.08))
+            step = max(1, to_int(live.get("sample_step"), 1))
 
             try:
                 img = capture_region(x, y, w, h)
@@ -2640,11 +3132,8 @@ class PixelTriggerApp:
                 tm = live.get("trigger_mode", "scroll")
                 if tm == "scroll":
                     direction = live.get("scroll_dir", "up")
-                    try:
-                        tp = int(live.get("total_pixels", "325"))
-                        dur = float(live.get("duration", "0.65"))
-                    except Exception:
-                        tp, dur = 325, 0.65
+                    tp = max(1, to_int(live.get("total_pixels"), 325))
+                    dur = max(0.05, to_float(live.get("duration"), 0.65))
                     # Windows 上把「总距离 × 滚动密度」的合成结果一并记入
                     # 日志，便于对照确认两个参数确实生效。
                     suffix = ""
@@ -2661,12 +3150,9 @@ class PixelTriggerApp:
                 else:
                     combo = live.get("key_combo", "")
                     action = live.get("key_action", "press")
-                    try:
-                        rc = int(live.get("key_repeat_count", "3"))
-                        ri = float(live.get("key_repeat_interval", "0.5"))
-                        hd = float(live.get("key_hold_duration", "1.0"))
-                    except Exception:
-                        rc, ri, hd = 3, 0.5, 1.0
+                    rc = max(1, to_int(live.get("key_repeat_count"), 3))
+                    ri = max(0.0, to_float(live.get("key_repeat_interval"), 0.5))
+                    hd = max(0.0, to_float(live.get("key_hold_duration"), 1.0))
                     disp = format_key_display(combo)
                     self.log_msg(f"✅ 检测到蓝线（{count} 像素），触发按键 {disp}"
                                  f"（{action}）")
@@ -2675,10 +3161,7 @@ class PixelTriggerApp:
                         args=(combo, action, rc, ri, hd, self.stop_event),
                         daemon=True).start()
 
-                try:
-                    cd = float(live.get("cd", "5"))
-                except Exception:
-                    cd = 5
+                cd = max(0.0, to_float(live.get("cd"), 5.0))
                 if cd > 0:
                     self.cooldown_start = time.time()
                     self.cooldown_until = self.cooldown_start + cd
@@ -2693,100 +3176,37 @@ class PixelTriggerApp:
             self.match_var.set(text)
 
     def on_close(self):
+        """关闭窗口。
+
+        参数改动早已在改动后 0.6 秒自动落盘，这里只做一次同步兜底：防止
+        用户改完参数立刻关窗（还处在防抖窗口内）丢掉最后一次改动。
+
+        不再弹「是否保存」对话框 —— 那个对话框恰恰是「明明选了保存、下次
+        打开配置还是没了」的最大来源：点「取消退出」、被模态窗口挡住，
+        或者直接 Cmd+Q / 结束进程，都会绕过它。
+        """
         if self._close_dialog_open:
             return
         self._close_dialog_open = True
         if self.running:
             self.stop()
-
-        if not self._has_changes():
-            self._quit()
-            return
-
-        self.root.update_idletasks()
-        rx, ry = self.root.winfo_rootx(), self.root.winfo_rooty()
-        rw, rh = self.root.winfo_width(), self.root.winfo_height()
-        dw, dh = 440, 220
-        dx = rx + (rw - dw) // 2
-        dy = ry + (rh - dh) // 2
         try:
-            screens = pb.list_displays()
-            cx, cy = rx + rw // 2, ry + rh // 2
-            target = None
-            for (sx, sy, sw, sh) in screens:
-                if sx <= cx < sx + sw and sy <= cy < sy + sh:
-                    target = (sx, sy, sw, sh)
-                    break
-            if target is None and screens:
-                target = screens[0]
-            if target:
-                sx, sy, sw, sh = target
-                dx = max(sx + 20, min(dx, sx + sw - dw - 20))
-                dy = max(sy + 20, min(dy, sy + sh - dh - 20))
+            self.flush_config()
         except Exception:
             pass
-        dlg = tk.Toplevel(self.root)
-        dlg.title("退出 PixelTrigger")
-        dlg.configure(bg=C_WINDOW_BG)
-        dlg.resizable(False, False)
-        dlg.transient(self.root)
-        dlg.grab_set()
-        dlg.geometry(f"{dw}x{dh}+{dx}+{dy}")
-        tk.Label(dlg, text="检测到参数已修改",
-                 bg=C_WINDOW_BG, fg=C_TITLE,
-                 font=(pb.FONT_UI, 14, "bold")).pack(pady=(24, 4))
-        tk.Label(dlg,
-                 text="是否保存本次修改的参数到配置文件？\n"
-                      "选择「不保存」则保留原配置。",
-                 bg=C_WINDOW_BG, fg=C_SUBTEXT,
-                 font=(pb.FONT_UI, 11),
-                 justify="center").pack(pady=(0, 18))
-        btns = tk.Frame(dlg, bg=C_WINDOW_BG)
-        btns.pack()
+        self._quit()
 
-        def _reset():
-            self._close_dialog_open = False
-
-        def do_save():
-            self.save_config()
-            _reset()
-            dlg.destroy()
-            self._quit()
-
-        def do_no_save():
-            _reset()
-            dlg.destroy()
-            self._quit()
-
-        def do_cancel():
-            _reset()
-            dlg.destroy()
-
-        dlg.protocol("WM_DELETE_WINDOW", do_cancel)
-
-        FancyButton(btns, "保存并退出",
-                    bg_normal=C_ACCENT, bg_hover=C_ACCENT_H,
-                    bg_disabled=C_GRAY_DISABLED,
-                    fg_normal=C_ON_ACCENT_BTN, fg_hover=C_ON_ACCENT_BTN_H,
-                    fg_disabled=C_GRAY_DISABLED_FG,
-                    command=do_save, font_size=11).pack(side="left", padx=4)
-        FancyButton(btns, "不保存直接退出",
-                    bg_normal=C_NEUTRAL_BTN, bg_hover=C_NEUTRAL_BTN_H,
-                    bg_disabled=C_GRAY_DISABLED, fg_normal=C_ON_ACCENT,
-                    fg_hover=C_ON_ACCENT,
-                    fg_disabled=C_GRAY_DISABLED_FG,
-                    command=do_no_save, font_size=11).pack(side="left", padx=4)
-        FancyButton(btns, "取消退出",
-                    bg_normal=C_GRAY_BG, bg_hover=C_GRAY_BG_H,
-                    bg_disabled=C_GRAY_DISABLED, fg_normal=C_TITLE,
-                    fg_hover=C_TITLE,
-                    fg_disabled=C_GRAY_DISABLED_FG,
-                    command=do_cancel, font_size=11).pack(side="left", padx=4)
 
     def _quit(self):
         # 置关闭标志：后台线程再往队列塞 UI 动作会被直接丢弃，
         # 轮询器也立即停止，杜绝销毁后再访问 Tk 对象导致的崩溃。
         self._closing = True
+        if self._autosave_job:
+            try:
+                self.root.after_cancel(self._autosave_job)
+            except Exception:
+                pass
+            self._autosave_job = None
         if self._ui_poll_job:
             try:
                 self.root.after_cancel(self._ui_poll_job)

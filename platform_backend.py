@@ -883,3 +883,106 @@ def open_ax_settings_page():
             check=False)
     except Exception:
         pass
+
+
+def reveal_in_file_manager(path):
+    """在系统文件管理器里定位并选中某个文件（找不到就打开所在目录）。"""
+    import subprocess
+    path = os.path.abspath(path)
+    folder = os.path.dirname(path)
+    if not os.path.exists(folder):
+        return False
+    try:
+        if IS_WIN:
+            if os.path.exists(path):
+                # 注意 "/select," 与路径之间必须靠参数分隔，不能拼成一个串
+                subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
+            else:
+                subprocess.Popen(["explorer", os.path.normpath(folder)])
+        elif sys.platform == "darwin":
+            args = ["open", "-R", path] if os.path.exists(path) else ["open", folder]
+            subprocess.Popen(args)
+        else:
+            subprocess.Popen(["xdg-open", folder])
+        return True
+    except Exception:
+        return False
+
+
+# ============================================================
+# 全局快捷键（macOS）
+#
+# 用 CGEventTap 监听系统级按键，实现「人在别的软件里（比如乐谱播放器）
+# 也能一键开始/停止监控」。监听需要辅助功能权限（本程序本来就要），
+# 拿不到权限时 CGEventTapCreate 返回 None，这里如实返回 False，
+# 由调用方降级为「窗口内快捷键」，绝不因为注册失败而影响主流程。
+# ============================================================
+HOTKEY_LABEL = "⌃⌥↩"
+
+
+def global_hotkey_supported():
+    """当前平台是否支持全局快捷键（Windows 版暂未提供）。"""
+    return IS_MAC
+
+
+def register_global_hotkey(callback, keycode=36,
+                           flags_mask=("control", "option")):
+    """注册 ⌃⌥↩ 全局快捷键。成功返回 True。
+
+    callback 会在**事件线程**里被调用，调用方必须自己切回主线程。
+    """
+    if not IS_MAC:
+        return False
+    try:
+        import threading
+        import Quartz
+    except Exception:
+        return False
+    try:
+        need = 0
+        if "control" in flags_mask:
+            need |= Quartz.kCGEventFlagMaskControl
+        if "option" in flags_mask:
+            need |= Quartz.kCGEventFlagMaskAlternate
+        if "command" in flags_mask:
+            need |= Quartz.kCGEventFlagMaskCommand
+        if "shift" in flags_mask:
+            need |= Quartz.kCGEventFlagMaskShift
+
+        def _cb(proxy, type_, event, refcon):
+            try:
+                if type_ == Quartz.kCGEventKeyDown:
+                    kc = Quartz.CGEventGetIntegerValueField(
+                        event, Quartz.kCGKeyboardEventKeycode)
+                    if kc == keycode and \
+                       (Quartz.CGEventGetFlags(event) & need) == need:
+                        callback()
+            except Exception:
+                pass
+            return event
+
+        tap = Quartz.CGEventTapCreate(
+            Quartz.kCGSessionEventTap,
+            Quartz.kCGHeadInsertEventTap,
+            Quartz.kCGEventTapOptionListenOnly,
+            Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown),
+            _cb, None)
+        if not tap:
+            return False
+        src = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
+
+        def _run():
+            try:
+                runloop = Quartz.CFRunLoopGetCurrent()
+                Quartz.CFRunLoopAddSource(
+                    runloop, src, Quartz.kCFRunLoopCommonModes)
+                Quartz.CGEventTapEnable(tap, True)
+                Quartz.CFRunLoopRun()
+            except Exception:
+                pass
+
+        threading.Thread(target=_run, daemon=True,
+                         name="pt-hotkey").start()
+        return True
+    except Exception:
+        return False
