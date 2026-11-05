@@ -473,16 +473,27 @@ def _mac_grab(x, y, w, h):
         width = Quartz.CGImageGetWidth(cg)
         height = Quartz.CGImageGetHeight(cg)
         bpr = Quartz.CGImageGetBytesPerRow(cg)
-        # 关键：先把 CGImage 的像素数据完整拷贝到 Python bytes，之后
-        # CGImage/CFData 交给 pyobjc 引用计数自动释放。
-        # 不能手动 CGImageRelease(cg)：pyobjc 托管对象在 Python 侧
+        # 像素数据经 CFData 的 buffer 协议直接交给 PIL，不做 bytes() 中转。
+        #
+        # v1.3.2 及之前这里是 buf = bytes(data)。在 pyobjc 下对 CFData 调
+        # bytes() 拿不到「拷贝完就归零」的结果：每次调用都留下与图像等大的
+        # 常驻内存，且不收敛。实测 228×127 区域（Retina 下 456×254 像素、
+        # 487680 字节）每帧 +483KB，750 帧净增 354MB，曲线严格线性。
+        # 监控循环按 it 间隔反复截图，内存因此一路爬到 GB 级。
+        #
+        # memoryview 不拷贝，只是延长 CFData 的生命周期；真正的像素拷贝由
+        # convert("RGB") 在 PIL 内完成。mv/data 作为局部变量活到 convert
+        # 结束，返回的 RGB 图已经是独立内存，之后 CFData 随引用计数归零。
+        # 同条件实测 750 帧净增 1.2MB（分配器预热），其后持平。
+        #
+        # 仍然不能手动 CGImageRelease(cg)：pyobjc 托管对象在 Python 侧
         # __del__ 里还会再 release 一次，手动释放会导致双重释放，在打包
         # 环境（冻结 pyobjc + macOS 15）下直接 SIGSEGV。
         data = Quartz.CGDataProviderCopyData(Quartz.CGImageGetDataProvider(cg))
-        buf = bytes(data)
-        del data
-        return Image.frombuffer("RGBA", (width, height), buf,
-                                "raw", "BGRA", bpr, 1).convert("RGB")
+        mv = memoryview(data)
+        img = Image.frombuffer("RGBA", (width, height), mv,
+                                "raw", "BGRA", bpr, 1)
+        return img.convert("RGB")
     except Exception:
         return None
 
