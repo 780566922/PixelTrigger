@@ -121,7 +121,14 @@ BUILT_APP="${STAGE}/dist/${APP_NAME}.app"
 
 mkdir -p "${PROJECT_DIR}/dist"
 APP="${PROJECT_DIR}/dist/${APP_NAME}.app"
-# 用 ditto 增量同步而非 rm -rf + cp -R：既更快，也避免大批量删除操作
+# 必须先清空再复制，不能对已存在的 .app 做增量合并。
+#
+# ditto 只覆盖同名文件、不删除源里已经没有的文件，于是上一轮构建的残留会一直
+# 留在 dist 里。v1.3.4 就是这么出事的一次：先用 Homebrew 的 Python 打了一版
+# （二进制 minos 26.0，内嵌了一堆 lib-dynload/*.so），换 uv 版 Python 重打后，
+# Homebrew 那批 .so 和 Frameworks/libtcl9.0.dylib 仍留在包里，产出一个新旧
+# 混杂的 bundle，装到 macOS 15 上一启动就 dyld 失败。
+rm -rf "${APP}"
 ditto "${BUILT_APP}" "${APP}"
 
 # --------------------------------------------------- 关键修复：lib 锚点
@@ -156,6 +163,64 @@ if "RUNTIME_OK" in res.stdout:
 else:
     print("    [FAIL]", (res.stdout + res.stderr)[-600:])
     sys.exit(1)
+PYEOF
+
+# --------------------------------------------------- 最低系统版本审计
+# 打包机装的 Python 决定产物的 minos：Homebrew 版 Python 是按构建机 macOS
+# 版本编译的（在 macOS 26 上装出来的就是 minos 26.0），而 uv 的独立发行版
+# 固定 11.0。产物里只要有一个 Mach-O 的 minos 高于 Info.plist 声明的
+# LSMinimumSystemVersion，旧系统上 dyld 就会拒绝加载，表现是 py2app 那句
+# 笼统的 "Launch error"。
+#
+# 这一步不信任"我用的应该是 uv 版 Python"，直接读每个二进制的 LC_BUILD_VERSION。
+echo "==> 审计最低系统版本（上限 macOS 11.0）"
+"${VENV_DIR}/bin/python" - "${APP}" <<'PYEOF'
+import os
+import subprocess
+import sys
+
+app = sys.argv[1]
+limit = (11, 0)
+bad = []
+count = 0
+
+for root, _dirs, files in os.walk(app):
+    for fn in files:
+        path = os.path.join(root, fn)
+        if not (fn.endswith((".so", ".dylib")) or os.access(path, os.X_OK)):
+            continue
+        try:
+            out = subprocess.run(["vtool", "-show-build", path],
+                                 capture_output=True, text=True,
+                                 timeout=20).stdout
+        except Exception:
+            continue
+        minos = None
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("minos "):
+                minos = line.split()[1]
+                break
+        if minos is None:
+            continue          # 不是 Mach-O
+        count += 1
+        try:
+            ver = tuple(int(x) for x in minos.split("."))
+        except ValueError:
+            continue
+        if ver > limit:
+            bad.append((minos, os.path.relpath(path, app)))
+
+if bad:
+    print(f"    [FAIL] {len(bad)}/{count} 个二进制要求高于 macOS 11.0：")
+    for minos, rel in sorted(bad)[:15]:
+        print(f"           {minos}  {rel}")
+    if len(bad) > 15:
+        print(f"            …… 另有 {len(bad) - 15} 个")
+    print("    常见根因：打包用的 Python 不是 uv 独立发行版（Homebrew 版按构建机"
+          "系统版本编译），或 dist 里残留了上一轮构建的文件。")
+    sys.exit(1)
+print(f"    [OK] {count} 个二进制全部 ≤ macOS 11.0")
 PYEOF
 
 # 验证已通过，最后再签名：签名动作必须收尾，否则任何一次字节码写入
